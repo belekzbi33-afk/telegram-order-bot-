@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: telegram-order-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn bot:app_web --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_USERNAME
+        value: weevoo26
