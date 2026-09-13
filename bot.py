@@ -6,7 +6,9 @@ from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 # =========================
@@ -14,10 +16,18 @@ from telegram.ext import (
 # =========================
 
 TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "weevoo26").lstrip("@")
+
+ADMIN_USERNAME = os.environ.get(
+    "ADMIN_USERNAME",
+    "weevoo26"
+).lstrip("@")
+
+# Account che riceve tutti i log
+LOG_ADMIN_USERNAME = "Weevoo26"
 
 BOT_USERNAME = "Oorderstatebot"
 DB = "orders.db"
+
 
 # =========================
 # DATABASE
@@ -38,15 +48,19 @@ def db():
     # Migrazione per database già esistenti
     columns = [
         row[1]
-        for row in con.execute("PRAGMA table_info(orders)").fetchall()
+        for row in con.execute(
+            "PRAGMA table_info(orders)"
+        ).fetchall()
     ]
 
     if "telegram_user_id" not in columns:
         con.execute(
-            "ALTER TABLE orders ADD COLUMN telegram_user_id INTEGER"
+            "ALTER TABLE orders "
+            "ADD COLUMN telegram_user_id INTEGER"
         )
 
     con.commit()
+
     return con
 
 
@@ -58,18 +72,33 @@ def text_for(status, progress):
     status = status.lower()
 
     if status == "in attesa":
-        return f"🟡 *In attesa*\n\nProgresso: {progress}%"
+        return (
+            f"🟡 *In attesa*\n\n"
+            f"Progresso: {progress}%"
+        )
 
     if status == "in elaborazione":
-        return f"🔵 *In elaborazione*\n\nProgresso: {progress}%"
+        return (
+            f"🔵 *In elaborazione*\n\n"
+            f"Progresso: {progress}%"
+        )
 
     if status == "completato":
-        return f"🟢 *Completato*\n\nProgresso: {progress}%"
+        return (
+            f"🟢 *Completato*\n\n"
+            f"Progresso: {progress}%"
+        )
 
     if status == "annullato":
-        return f"🔴 *Annullato*\n\nProgresso: {progress}%"
+        return (
+            f"🔴 *Annullato*\n\n"
+            f"Progresso: {progress}%"
+        )
 
-    return f"📦 *{status}*\n\nProgresso: {progress}%"
+    return (
+        f"📦 *{status}*\n\n"
+        f"Progresso: {progress}%"
+    )
 
 
 def status_from_command(status):
@@ -104,10 +133,106 @@ def is_admin(update: Update):
 
 
 # =========================
+# LOG ATTIVITÀ CLIENTI
+# =========================
+
+async def log_client_activity(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+
+    if not user:
+        return
+
+    # Non registrare le attività dell'admin
+    if is_admin(update):
+        return
+
+    username = (
+        f"@{user.username}"
+        if user.username
+        else user.full_name
+    )
+
+    # Cerca l'ordine associato al cliente
+    con = db()
+
+    row = con.execute(
+        """
+        SELECT code
+        FROM orders
+        WHERE telegram_user_id = ?
+        ORDER BY rowid DESC
+        LIMIT 1
+        """,
+        (user.id,)
+    ).fetchone()
+
+    con.close()
+
+    order_code = (
+        row[0]
+        if row
+        else "Nessun ordine associato"
+    )
+
+    # =========================
+    # DETERMINA COSA HA FATTO
+    # =========================
+
+    if update.message:
+
+        if update.message.text:
+            message_text = update.message.text
+        else:
+            message_text = "[Messaggio non testuale]"
+
+    else:
+        message_text = "[Interazione non testuale]"
+
+    # Evita messaggi troppo lunghi
+    if len(message_text) > 1000:
+        message_text = (
+            message_text[:1000]
+            + "..."
+        )
+
+    # =========================
+    # NOTIFICA ADMIN
+    # =========================
+
+    admin_text = (
+        "🔔 *NUOVA ATTIVITÀ CLIENTE*\n\n"
+        f"👤 {username}\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"📦 Ordine: `{order_code}`\n\n"
+        f"💬 Messaggio:\n"
+        f"`{message_text}`"
+    )
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=f"@{LOG_ADMIN_USERNAME}",
+            text=admin_text,
+            parse_mode="Markdown"
+        )
+
+    except Exception:
+        # Se l'invio non funziona,
+        # non bloccare il bot.
+        pass
+
+
+# =========================
 # /START
 # =========================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user = update.effective_user
 
@@ -161,7 +286,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📦 *Ordine #{order_code}*\n\n"
             f"{text_for(status, progress)}\n\n"
-            "✅ Questo ordine è stato associato al tuo account Telegram.\n"
+            "✅ Questo ordine è stato associato "
+            "al tuo account Telegram.\n"
             "La prossima volta ti basterà premere /start.",
             parse_mode="Markdown"
         )
@@ -203,8 +329,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Ciao! Benvenuto.\n\n"
         "📦 Per controllare lo stato del tuo ordine, "
         "apri il link che ti è stato inviato e premi *Start*.\n\n"
-        "Dopo la prima apertura, il bot ricorderà automaticamente "
-        "il tuo ordine.",
+        "Dopo la prima apertura, il bot ricorderà "
+        "automaticamente il tuo ordine.",
         parse_mode="Markdown"
     )
 
@@ -213,10 +339,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /ADMIN
 # =========================
 
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if not is_admin(update):
-        await update.message.reply_text("❌ Non autorizzato.")
+        await update.message.reply_text(
+            "❌ Non autorizzato."
+        )
         return
 
     await update.message.reply_text(
@@ -236,10 +367,15 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /CREA
 # =========================
 
-async def crea(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def crea(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if not is_admin(update):
-        await update.message.reply_text("❌ Non autorizzato.")
+        await update.message.reply_text(
+            "❌ Non autorizzato."
+        )
         return
 
     if not context.args:
@@ -253,6 +389,7 @@ async def crea(update: Update, context: ContextTypes.DEFAULT_TYPE):
     con = db()
 
     try:
+
         con.execute(
             """
             INSERT INTO orders (
@@ -269,6 +406,7 @@ async def crea(update: Update, context: ContextTypes.DEFAULT_TYPE):
         con.commit()
 
     except sqlite3.IntegrityError:
+
         con.close()
 
         await update.message.reply_text(
@@ -279,7 +417,11 @@ async def crea(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     con.close()
 
-    link = f"https://t.me/{BOT_USERNAME}?start={code}"
+    link = (
+        f"https://t.me/"
+        f"{BOT_USERNAME}"
+        f"?start={code}"
+    )
 
     await update.message.reply_text(
         f"✅ Ordine creato!\n\n"
@@ -293,13 +435,19 @@ async def crea(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /STATO
 # =========================
 
-async def stato(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stato(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if not is_admin(update):
-        await update.message.reply_text("❌ Non autorizzato.")
+        await update.message.reply_text(
+            "❌ Non autorizzato."
+        )
         return
 
     if len(context.args) < 2:
+
         await update.message.reply_text(
             "Uso:\n"
             "/stato CODICE attesa\n"
@@ -307,14 +455,22 @@ async def stato(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/stato CODICE completato\n"
             "/stato CODICE annullato"
         )
+
         return
 
     code = context.args[0].strip()
-    new_status_key = context.args[1].lower().strip()
+    new_status_key = (
+        context.args[1]
+        .lower()
+        .strip()
+    )
 
-    result = status_from_command(new_status_key)
+    result = status_from_command(
+        new_status_key
+    )
 
     if not result:
+
         await update.message.reply_text(
             "❌ Stato non valido.\n\n"
             "Usa:\n"
@@ -323,6 +479,7 @@ async def stato(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "completato\n"
             "annullato"
         )
+
         return
 
     new_status, progress = result
@@ -339,11 +496,13 @@ async def stato(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ).fetchone()
 
     if not row:
+
         con.close()
 
         await update.message.reply_text(
             "❌ Ordine non trovato."
         )
+
         return
 
     telegram_user_id = row[0]
@@ -355,7 +514,11 @@ async def stato(update: Update, context: ContextTypes.DEFAULT_TYPE):
         SET status = ?, progress = ?
         WHERE code = ?
         """,
-        (new_status, progress, code)
+        (
+            new_status,
+            progress,
+            code
+        )
     )
 
     con.commit()
@@ -386,6 +549,7 @@ async def stato(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         except Exception:
+
             # Il cliente potrebbe aver bloccato il bot,
             # cancellato la chat, ecc.
             pass
@@ -401,20 +565,53 @@ application = (
     .build()
 )
 
+
+# =========================
+# COMMAND HANDLERS
+# =========================
+
 application.add_handler(
-    CommandHandler("start", start)
+    CommandHandler(
+        "start",
+        start
+    )
 )
 
 application.add_handler(
-    CommandHandler("admin", admin)
+    CommandHandler(
+        "admin",
+        admin
+    )
 )
 
 application.add_handler(
-    CommandHandler("crea", crea)
+    CommandHandler(
+        "crea",
+        crea
+    )
 )
 
 application.add_handler(
-    CommandHandler("stato", stato)
+    CommandHandler(
+        "stato",
+        stato
+    )
+)
+
+
+# =========================
+# LOG HANDLER
+# =========================
+# Viene eseguito dopo i normali
+# command handler, così registra
+# anche i comandi utilizzati.
+
+application.add_handler(
+    MessageHandler(
+        filters.ALL,
+        log_client_activity
+    ),
+    group=1
 )
 
 
@@ -426,7 +623,9 @@ app_web = FastAPI()
 
 
 @app_web.post("/telegram")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(
+    request: Request
+):
 
     data = await request.json()
 
@@ -435,7 +634,9 @@ async def telegram_webhook(request: Request):
         application.bot
     )
 
-    await application.process_update(update)
+    await application.process_update(
+        update
+    )
 
     return {"ok": True}
 
@@ -452,7 +653,9 @@ async def startup():
     await application.initialize()
     await application.start()
 
-    external_url = os.environ.get("RENDER_EXTERNAL_URL")
+    external_url = os.environ.get(
+        "RENDER_EXTERNAL_URL"
+    )
 
     if external_url:
 
