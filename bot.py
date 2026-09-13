@@ -17,16 +17,16 @@ from telegram.ext import (
 
 TOKEN = os.environ["BOT_TOKEN"]
 
-ADMIN_USERNAME = os.environ.get(
-    "ADMIN_USERNAME",
-    "weevoo26"
-).lstrip("@")
-
-# Account che riceve tutti i log
-LOG_ADMIN_USERNAME = "Weevoo26"
+ADMIN_USERNAME = "weevoo26"
 
 BOT_USERNAME = "Oorderstatebot"
+
 DB = "orders.db"
+
+# ID Telegram dell'admin.
+# Viene salvato automaticamente quando
+# l'admin usa /start.
+ADMIN_ID = None
 
 
 # =========================
@@ -45,7 +45,6 @@ def db():
         )
     """)
 
-    # Migrazione per database già esistenti
     columns = [
         row[1]
         for row in con.execute(
@@ -65,10 +64,30 @@ def db():
 
 
 # =========================
-# STATI
+# ADMIN
+# =========================
+
+def is_admin(update: Update):
+    user = update.effective_user
+
+    if not user:
+        return False
+
+    if not user.username:
+        return False
+
+    return (
+        user.username.lower()
+        == ADMIN_USERNAME.lower()
+    )
+
+
+# =========================
+# ORDINE / STATO
 # =========================
 
 def text_for(status, progress):
+
     status = status.lower()
 
     if status == "in attesa":
@@ -102,7 +121,6 @@ def text_for(status, progress):
 
 
 def status_from_command(status):
-    status = status.lower()
 
     mapping = {
         "attesa": ("In attesa", 0),
@@ -111,41 +129,28 @@ def status_from_command(status):
         "annullato": ("Annullato", 0),
     }
 
-    return mapping.get(status)
+    return mapping.get(
+        status.lower()
+    )
 
 
 # =========================
-# ADMIN
-# =========================
-
-def is_admin(update: Update):
-    user = update.effective_user
-
-    if not user:
-        return False
-
-    username = user.username
-
-    if not username:
-        return False
-
-    return username.lower() == ADMIN_USERNAME.lower()
-
-
-# =========================
-# LOG ATTIVITÀ CLIENTI
+# LOG CLIENTI
 # =========================
 
 async def log_client_activity(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
+    global ADMIN_ID
+
     user = update.effective_user
 
     if not user:
         return
 
-    # Non registrare le attività dell'admin
+    # Non registrare l'admin
     if is_admin(update):
         return
 
@@ -155,7 +160,7 @@ async def log_client_activity(
         else user.full_name
     )
 
-    # Cerca l'ordine associato al cliente
+    # Cerca ordine associato
     con = db()
 
     row = con.execute(
@@ -177,10 +182,7 @@ async def log_client_activity(
         else "Nessun ordine associato"
     )
 
-    # =========================
-    # DETERMINA COSA HA FATTO
-    # =========================
-
+    # Cosa ha fatto il cliente
     if update.message:
 
         if update.message.text:
@@ -191,38 +193,40 @@ async def log_client_activity(
     else:
         message_text = "[Interazione non testuale]"
 
-    # Evita messaggi troppo lunghi
+    # Limite messaggio
     if len(message_text) > 1000:
         message_text = (
             message_text[:1000]
             + "..."
         )
 
-    # =========================
-    # NOTIFICA ADMIN
-    # =========================
+    # Se non abbiamo ancora l'ID admin,
+    # non possiamo mandare il log.
+    if not ADMIN_ID:
+        return
 
-    admin_text = (
-        "🔔 *NUOVA ATTIVITÀ CLIENTE*\n\n"
+    log_text = (
+        "🔔 NUOVA ATTIVITÀ CLIENTE\n\n"
         f"👤 {username}\n"
-        f"🆔 ID: `{user.id}`\n"
-        f"📦 Ordine: `{order_code}`\n\n"
+        f"🆔 ID: {user.id}\n"
+        f"📦 Ordine: {order_code}\n\n"
         f"💬 Messaggio:\n"
-        f"`{message_text}`"
+        f"{message_text}"
     )
 
     try:
 
         await context.bot.send_message(
-            chat_id=f"@{LOG_ADMIN_USERNAME}",
-            text=admin_text,
-            parse_mode="Markdown"
+            chat_id=ADMIN_ID,
+            text=log_text
         )
 
-    except Exception:
-        # Se l'invio non funziona,
-        # non bloccare il bot.
-        pass
+    except Exception as e:
+
+        print(
+            "ERRORE INVIO LOG:",
+            e
+        )
 
 
 # =========================
@@ -234,10 +238,24 @@ async def start(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    global ADMIN_ID
+
     user = update.effective_user
 
     if not user:
         return
+
+    # ---------------------------------
+    # SALVA AUTOMATICAMENTE L'ID ADMIN
+    # ---------------------------------
+
+    if is_admin(update):
+
+        ADMIN_ID = user.id
+
+        print(
+            f"ADMIN_ID salvato: {ADMIN_ID}"
+        )
 
     con = db()
 
@@ -259,6 +277,7 @@ async def start(
         ).fetchone()
 
         if not row:
+
             con.close()
 
             await update.message.reply_text(
@@ -268,14 +287,17 @@ async def start(
 
             return
 
-        # Associa l'utente Telegram all'ordine
+        # Associa ordine al cliente
         con.execute(
             """
             UPDATE orders
             SET telegram_user_id = ?
             WHERE code = ?
             """,
-            (user.id, code)
+            (
+                user.id,
+                code
+            )
         )
 
         con.commit()
@@ -323,8 +345,6 @@ async def start(
 
         return
 
-    # Nessun ordine associato
-
     await update.message.reply_text(
         "👋 Ciao! Benvenuto.\n\n"
         "📦 Per controllare lo stato del tuo ordine, "
@@ -345,9 +365,11 @@ async def admin(
 ):
 
     if not is_admin(update):
+
         await update.message.reply_text(
             "❌ Non autorizzato."
         )
+
         return
 
     await update.message.reply_text(
@@ -373,15 +395,19 @@ async def crea(
 ):
 
     if not is_admin(update):
+
         await update.message.reply_text(
             "❌ Non autorizzato."
         )
+
         return
 
     if not context.args:
+
         await update.message.reply_text(
             "Uso:\n/crea CODICE"
         )
+
         return
 
     code = context.args[0].strip()
@@ -400,7 +426,11 @@ async def crea(
             )
             VALUES (?, ?, ?, NULL)
             """,
-            (code, "In attesa", 0)
+            (
+                code,
+                "In attesa",
+                0
+            )
         )
 
         con.commit()
@@ -441,9 +471,11 @@ async def stato(
 ):
 
     if not is_admin(update):
+
         await update.message.reply_text(
             "❌ Non autorizzato."
         )
+
         return
 
     if len(context.args) < 2:
@@ -459,6 +491,7 @@ async def stato(
         return
 
     code = context.args[0].strip()
+
     new_status_key = (
         context.args[1]
         .lower()
@@ -507,7 +540,7 @@ async def stato(
 
     telegram_user_id = row[0]
 
-    # Aggiorna database
+    # Aggiorna ordine
     con.execute(
         """
         UPDATE orders
@@ -524,17 +557,14 @@ async def stato(
     con.commit()
     con.close()
 
-    # Conferma all'admin
+    # Conferma admin
     await update.message.reply_text(
         f"✅ Ordine `{code}` aggiornato.\n\n"
         f"{text_for(new_status, progress)}",
         parse_mode="Markdown"
     )
 
-    # ---------------------------------
-    # NOTIFICA AUTOMATICA AL CLIENTE
-    # ---------------------------------
-
+    # Notifica cliente
     if telegram_user_id:
 
         try:
@@ -548,11 +578,12 @@ async def stato(
                 parse_mode="Markdown"
             )
 
-        except Exception:
+        except Exception as e:
 
-            # Il cliente potrebbe aver bloccato il bot,
-            # cancellato la chat, ecc.
-            pass
+            print(
+                "ERRORE NOTIFICA CLIENTE:",
+                e
+            )
 
 
 # =========================
@@ -567,7 +598,7 @@ application = (
 
 
 # =========================
-# COMMAND HANDLERS
+# HANDLERS
 # =========================
 
 application.add_handler(
@@ -600,11 +631,8 @@ application.add_handler(
 
 
 # =========================
-# LOG HANDLER
+# LOG DI TUTTI I MESSAGGI
 # =========================
-# Viene eseguito dopo i normali
-# command handler, così registra
-# anche i comandi utilizzati.
 
 application.add_handler(
     MessageHandler(
@@ -616,7 +644,7 @@ application.add_handler(
 
 
 # =========================
-# FASTAPI / WEBHOOK
+# FASTAPI
 # =========================
 
 app_web = FastAPI()
@@ -638,7 +666,9 @@ async def telegram_webhook(
         update
     )
 
-    return {"ok": True}
+    return {
+        "ok": True
+    }
 
 
 # =========================
@@ -665,6 +695,11 @@ async def startup():
         )
 
         await application.bot.set_webhook(
+            webhook_url
+        )
+
+        print(
+            "Webhook impostato:",
             webhook_url
         )
 
