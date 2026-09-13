@@ -1,57 +1,70 @@
 import os
 import sqlite3
-from datetime import datetime
+import asyncio
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, Request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
     filters,
 )
 
-# ============================================================
+# =========================================================
 # CONFIG
-# ============================================================
+# =========================================================
 
 TOKEN = os.environ["BOT_TOKEN"]
+
 ADMIN_USERNAME = "weevoo26"
 BOT_USERNAME = "Oorderstatebot"
 
 DB = "orders.db"
 
+app_web = FastAPI()
 
-# ============================================================
+telegram_app = Application.builder().token(TOKEN).build()
+
+
+# =========================================================
 # DATABASE
-# ============================================================
+# =========================================================
 
-def db():
-    con = sqlite3.connect(DB)
-    con.row_factory = sqlite3.Row
+def db_connect():
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    con.execute("""
+
+def init_db():
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             code TEXT PRIMARY KEY,
             status TEXT NOT NULL DEFAULT 'In attesa',
             progress INTEGER NOT NULL DEFAULT 0,
             eta_minutes INTEGER,
             telegram_user_id INTEGER,
-            created_at TEXT,
-            updated_at TEXT
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
         )
     """)
 
-    con.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
     """)
 
-    con.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS activity_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             telegram_user_id INTEGER,
@@ -59,180 +72,91 @@ def db():
             order_code TEXT,
             action TEXT,
             message TEXT,
-            created_at TEXT
+            created_at TEXT NOT NULL
         )
     """)
 
-    con.commit()
-    return con
+    # Migrazione per database vecchi che non hanno completed_at
+    columns = [
+        row["name"]
+        for row in cur.execute("PRAGMA table_info(orders)").fetchall()
+    ]
 
+    if "completed_at" not in columns:
+        cur.execute(
+            "ALTER TABLE orders ADD COLUMN completed_at TEXT"
+        )
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+# =========================================================
+# UTILS
+# =========================================================
 
 def now():
-    return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    return datetime.now()
 
 
-# ============================================================
-# ADMIN
-# ============================================================
-
-def is_admin(update):
-    user = update.effective_user
-
-    return bool(
-        user
-        and user.username
-        and user.username.lower() == ADMIN_USERNAME.lower()
-    )
-
-
-def save_admin_id(user_id):
-    con = db()
-
-    con.execute("""
-        INSERT OR REPLACE INTO settings(key, value)
-        VALUES (?, ?)
-    """, ("admin_id", str(user_id)))
-
-    con.commit()
-    con.close()
+def now_str():
+    return now().isoformat()
 
 
 def get_admin_id():
-    con = db()
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = 'admin_id'"
+    ).fetchone()
+    conn.close()
 
-    row = con.execute("""
-        SELECT value
-        FROM settings
-        WHERE key = 'admin_id'
-    """).fetchone()
+    if row:
+        try:
+            return int(row["value"])
+        except:
+            return None
 
-    con.close()
-
-    if not row:
-        return None
-
-    try:
-        return int(row["value"])
-    except ValueError:
-        return None
+    return None
 
 
-def user_name(user):
-    if user.username:
-        return f"@{user.username}"
-
-    return user.full_name or "Utente"
-
-
-# ============================================================
-# ORDINI
-# ============================================================
-
-STATUSES = {
-    "0": ("In attesa", 0),
-    "25": ("Preso in carico", 25),
-    "50": ("In elaborazione", 50),
-    "70": ("Quasi completato", 70),
-    "100": ("Completato", 100),
-}
+def save_admin_id(user_id):
+    conn = db_connect()
+    conn.execute("""
+        INSERT INTO settings(key, value)
+        VALUES('admin_id', ?)
+        ON CONFLICT(key)
+        DO UPDATE SET value = excluded.value
+    """, (str(user_id),))
+    conn.commit()
+    conn.close()
 
 
-def get_order(code):
-    con = db()
-
-    row = con.execute("""
-        SELECT *
-        FROM orders
-        WHERE code = ?
-    """, (code,)).fetchone()
-
-    con.close()
-
-    return row
-
-
-def get_user_order(user_id):
-    con = db()
-
-    row = con.execute("""
-        SELECT *
-        FROM orders
-        WHERE telegram_user_id = ?
-        ORDER BY rowid DESC
-        LIMIT 1
-    """, (user_id,)).fetchone()
-
-    con.close()
-
-    return row
-
-
-def progress_bar(progress):
-    filled = round(progress / 10)
-
-    return (
-        "▰" * filled +
-        "░" * (10 - filled)
-    )
-
-
-def order_text(row):
-    progress = row["progress"]
-
-    if progress == 0:
-        emoji = "🟡"
-    elif progress < 70:
-        emoji = "🔵"
-    elif progress < 100:
-        emoji = "🟠"
-    else:
-        emoji = "🟢"
-
-    text = (
-        f"{emoji} {row['status']}\n\n"
-        f"{progress_bar(progress)} {progress}%"
-    )
-
-    if row["eta_minutes"] is not None:
-        if row["eta_minutes"] == 0:
-            text += "\n⏱️ Tempo stimato: imminente"
-        else:
-            text += (
-                f"\n⏱️ Tempo stimato: "
-                f"{row['eta_minutes']} minuti"
-            )
-
-    return text
-
-
-# ============================================================
-# LOG
-# ============================================================
-
-async def log_activity(update, context, action, message):
+def is_admin(update: Update):
     user = update.effective_user
 
-    if not user or is_admin(update):
-        return
+    if not user:
+        return False
 
-    con = db()
+    username = user.username or ""
 
-    row = con.execute("""
-        SELECT code
-        FROM orders
-        WHERE telegram_user_id = ?
-        ORDER BY rowid DESC
-        LIMIT 1
-    """, (user.id,)).fetchone()
+    return username.lower() == ADMIN_USERNAME.lower()
 
-    order_code = (
-        row["code"]
-        if row
-        else "Nessun ordine"
-    )
 
-    con.execute("""
-        INSERT INTO activity_logs(
+def log_activity(
+    user_id=None,
+    username=None,
+    order_code=None,
+    action="",
+    message=""
+):
+    conn = db_connect()
+
+    conn.execute("""
+        INSERT INTO activity_logs
+        (
             telegram_user_id,
             username,
             order_code,
@@ -242,72 +166,120 @@ async def log_activity(update, context, action, message):
         )
         VALUES (?, ?, ?, ?, ?, ?)
     """, (
-        user.id,
-        user_name(user),
+        user_id,
+        username,
         order_code,
         action,
-        message[:1000],
-        now()
+        message,
+        now_str()
     ))
 
-    con.commit()
-    con.close()
+    conn.commit()
+    conn.close()
 
-    admin_id = get_admin_id()
 
-    if not admin_id:
-        return
+# =========================================================
+# AUTO DELETE ORDERS
+# =========================================================
+
+def delete_expired_orders():
+    """
+    Cancella esclusivamente gli ordini completati da almeno 30 minuti.
+    Gli ordini non completati non vengono mai cancellati.
+    """
+
+    limit = now() - timedelta(minutes=30)
+
+    conn = db_connect()
+
+    rows = conn.execute("""
+        SELECT code
+        FROM orders
+        WHERE progress = 100
+        AND completed_at IS NOT NULL
+        AND completed_at <= ?
+    """, (limit.isoformat(),)).fetchall()
+
+    for row in rows:
+        code = row["code"]
+
+        conn.execute(
+            "DELETE FROM orders WHERE code = ?",
+            (code,)
+        )
+
+        log_activity(
+            action="auto_delete",
+            order_code=code,
+            message="Ordine cancellato automaticamente dopo 30 minuti dal completamento."
+        )
+
+    conn.commit()
+    conn.close()
+
+
+async def cleanup_loop():
+    while True:
+        try:
+            delete_expired_orders()
+        except Exception as e:
+            print("Errore cleanup:", e)
+
+        # Controlla ogni minuto
+        await asyncio.sleep(60)
+
+
+# =========================================================
+# ORDER FUNCTIONS
+# =========================================================
+
+def get_order(code):
+    conn = db_connect()
+
+    row = conn.execute("""
+        SELECT *
+        FROM orders
+        WHERE code = ?
+    """, (code.upper(),)).fetchone()
+
+    conn.close()
+
+    return row
+
+
+def progress_bar(progress):
+    total = 10
+    filled = round(progress / 10)
+
+    return "█" * filled + "░" * (total - filled)
+
+
+def order_text(row):
+
+    status = row["status"]
+    progress = row["progress"]
+    eta = row["eta_minutes"]
 
     text = (
-        "🔔 NUOVA ATTIVITÀ\n\n"
-        f"👤 {user_name(user)}\n"
-        f"🆔 ID: {user.id}\n"
-        f"📦 Ordine: {order_code}\n"
-        f"🕐 {now()}\n\n"
-        f"⚡ {action}\n"
-        f"💬 {message[:1000]}"
+        f"📦 <b>Ordine {row['code']}</b>\n\n"
+        f"📍 Stato: <b>{status}</b>\n"
+        f"📊 Avanzamento: <b>{progress}%</b>\n\n"
+        f"{progress_bar(progress)}"
     )
 
-    try:
-        await context.bot.send_message(
-            chat_id=admin_id,
-            text=text
-        )
-    except Exception as e:
-        print("Errore log:", e)
+    if eta is not None:
+        text += f"\n\n⏱️ Tempo stimato: <b>{eta} minuti</b>"
+
+    return text
 
 
-# ============================================================
-# MENU CLIENTE
-# ============================================================
-
-def client_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "📦 Il mio ordine",
-                callback_data="client_order"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔄 Aggiorna",
-                callback_data="client_order"
-            ),
-            InlineKeyboardButton(
-                "ℹ️ Informazioni",
-                callback_data="client_info"
-            )
-        ]
-    ])
-
-
-# ============================================================
-# MENU ADMIN
-# ============================================================
+# =========================================================
+# ADMIN MENU
+# =========================================================
 
 def admin_menu():
-    return InlineKeyboardMarkup([
+
+    keyboard = [
         [
             InlineKeyboardButton(
                 "➕ Crea ordine",
@@ -332,363 +304,539 @@ def admin_menu():
             InlineKeyboardButton(
                 "⏱️ Imposta minuti",
                 callback_data="admin_eta"
-            )
-        ],
-        [
+            ),
             InlineKeyboardButton(
                 "📊 Statistiche",
                 callback_data="admin_stats"
-            ),
-            InlineKeyboardButton(
-                "👥 Clienti",
-                callback_data="admin_clients"
             )
         ],
         [
+            InlineKeyboardButton(
+                "👥 Clienti",
+                callback_data="admin_clients"
+            ),
             InlineKeyboardButton(
                 "📜 Log attività",
                 callback_data="admin_logs"
             )
         ]
-    ])
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
 
 
-# ============================================================
+# =========================================================
+# CLIENT MENU
+# =========================================================
+
+def client_menu():
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📦 Il mio ordine",
+                callback_data="client_order"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔄 Aggiorna",
+                callback_data="client_refresh"
+            ),
+            InlineKeyboardButton(
+                "ℹ️ Informazioni",
+                callback_data="client_info"
+            )
+        ]
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# =========================================================
 # /START
-# ============================================================
+# =========================================================
 
-async def start(update, context):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     user = update.effective_user
 
     if not user:
         return
 
-    if is_admin(update):
+    username = user.username or ""
+
+    # Salva automaticamente l'ID dell'admin
+    if username.lower() == ADMIN_USERNAME.lower():
         save_admin_id(user.id)
 
+        log_activity(
+            user_id=user.id,
+            username=username,
+            action="admin_start",
+            message="/start admin"
+        )
+
         await update.message.reply_text(
-            "🛠️ PANNELLO ADMIN\n\n"
+            "👑 <b>Pannello amministratore</b>\n\n"
             "Usa i pulsanti qui sotto.",
+            parse_mode="HTML",
             reply_markup=admin_menu()
         )
+
         return
 
-    start_code = (
-        context.args[0].strip()
-        if context.args
-        else "Nessun codice"
-    )
+    args = context.args
 
-    await log_activity(
-        update,
-        context,
-        "START",
-        f"/start {start_code}"
-    )
+    # /start CODICE
+    if args:
 
-    if context.args:
-        code = context.args[0].strip()
-        row = get_order(code)
+        code = args[0].upper()
 
-        if not row:
+        order = get_order(code)
+
+        if not order:
+
+            log_activity(
+                user_id=user.id,
+                username=username,
+                order_code=code,
+                action="start_invalid_order",
+                message=f"/start {code}"
+            )
+
             await update.message.reply_text(
                 "❌ Ordine non trovato."
             )
+
             return
 
-        con = db()
+        # Associa l'utente all'ordine
+        conn = db_connect()
 
-        con.execute("""
+        conn.execute("""
             UPDATE orders
             SET telegram_user_id = ?,
                 updated_at = ?
             WHERE code = ?
         """, (
             user.id,
-            now(),
+            now_str(),
             code
         ))
 
-        con.commit()
-        con.close()
+        conn.commit()
+        conn.close()
 
-        updated = get_order(code)
+        log_activity(
+            user_id=user.id,
+            username=username,
+            order_code=code,
+            action="associate_order",
+            message=f"/start {code}"
+        )
 
         await update.message.reply_text(
-            f"📦 Ordine #{code}\n\n"
-            + order_text(updated),
+            "✅ Ordine associato!\n\n" +
+            order_text(get_order(code)),
+            parse_mode="HTML",
             reply_markup=client_menu()
         )
 
         return
 
-    row = get_user_order(user.id)
+    # /start senza codice
+    conn = db_connect()
 
-    if row:
-        await update.message.reply_text(
-            f"📦 Ordine #{row['code']}\n\n"
-            + order_text(row),
-            reply_markup=client_menu()
-        )
-        return
+    order = conn.execute("""
+        SELECT *
+        FROM orders
+        WHERE telegram_user_id = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+    """, (user.id,)).fetchone()
 
-    await update.message.reply_text(
-        "👋 Benvenuto!\n\n"
-        "Apri il link del tuo ordine e premi Start "
-        "per associarlo automaticamente.",
-        reply_markup=client_menu()
+    conn.close()
+
+    log_activity(
+        user_id=user.id,
+        username=username,
+        order_code=order["code"] if order else None,
+        action="client_start",
+        message="/start"
     )
 
+    if order:
 
-# ============================================================
+        await update.message.reply_text(
+            order_text(order),
+            parse_mode="HTML",
+            reply_markup=client_menu()
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "👋 Benvenuto!\n\n"
+            "Non hai ancora un ordine associato."
+        )
+
+
+# =========================================================
 # /ADMIN
-# ============================================================
+# =========================================================
 
-async def admin_command(update, context):
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     if not is_admin(update):
+
         await update.message.reply_text(
             "❌ Non autorizzato."
         )
+
         return
 
     save_admin_id(update.effective_user.id)
 
+    log_activity(
+        user_id=update.effective_user.id,
+        username=update.effective_user.username,
+        action="admin_panel",
+        message="/admin"
+    )
+
     await update.message.reply_text(
-        "🛠️ PANNELLO ADMIN\n\n"
-        "Scegli un'operazione:",
+        "👑 <b>Pannello amministratore</b>",
+        parse_mode="HTML",
         reply_markup=admin_menu()
     )
 
 
-# ============================================================
+# =========================================================
 # ADMIN CALLBACK
-# ============================================================
+# =========================================================
 
-async def admin_callback(update, context):
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     query = update.callback_query
+
     await query.answer()
 
     if not is_admin(update):
-        await query.edit_message_text(
-            "❌ Non autorizzato."
-        )
+        await query.edit_message_text("❌ Non autorizzato.")
         return
 
-    save_admin_id(update.effective_user.id)
+    data = query.data
 
-    action = query.data
+    # -------------------------
+    # CREA
+    # -------------------------
 
-    if action == "admin_create":
+    if data == "admin_create":
+
         context.user_data["action"] = "create"
 
         await query.edit_message_text(
-            "➕ CREA ORDINE\n\n"
-            "Scrivi il codice dell'ordine."
+            "➕ <b>Crea ordine</b>\n\n"
+            "Invia il codice dell'ordine.\n\n"
+            "Esempio:\n"
+            "<code>ABC123</code>",
+            parse_mode="HTML"
         )
+
         return
 
-    if action == "admin_list":
-        con = db()
+    # -------------------------
+    # LISTA
+    # -------------------------
 
-        rows = con.execute("""
-            SELECT code, status, progress, eta_minutes
+    if data == "admin_list":
+
+        delete_expired_orders()
+
+        conn = db_connect()
+
+        rows = conn.execute("""
+            SELECT *
             FROM orders
-            ORDER BY rowid DESC
-            LIMIT 30
+            ORDER BY created_at DESC
         """).fetchall()
 
-        con.close()
+        conn.close()
 
         if not rows:
-            text = "📋 Nessun ordine presente."
-        else:
-            text = "📋 ORDINI\n\n"
 
-            for row in rows:
-                eta = (
-                    f"{row['eta_minutes']} min"
-                    if row["eta_minutes"] is not None
-                    else "-"
-                )
+            await query.edit_message_text(
+                "📋 Nessun ordine presente.",
+                reply_markup=admin_menu()
+            )
 
-                text += (
-                    f"📦 {row['code']}\n"
-                    f"   {row['status']} — "
-                    f"{row['progress']}%\n"
-                    f"   ⏱️ {eta}\n\n"
-                )
+            return
+
+        text = "📋 <b>Ordini presenti</b>\n\n"
+
+        for row in rows:
+
+            text += (
+                f"📦 <b>{row['code']}</b>\n"
+                f"   {row['status']} — {row['progress']}%\n"
+            )
+
+            if row["eta_minutes"] is not None:
+                text += f"   ⏱️ {row['eta_minutes']} min\n"
+
+            text += "\n"
 
         await query.edit_message_text(
             text,
+            parse_mode="HTML",
             reply_markup=admin_menu()
         )
+
         return
 
-    if action == "admin_search":
+    # -------------------------
+    # CERCA
+    # -------------------------
+
+    if data == "admin_search":
+
         context.user_data["action"] = "search"
 
         await query.edit_message_text(
-            "🔎 CERCA ORDINE\n\n"
-            "Scrivi il codice."
+            "🔎 <b>Cerca ordine</b>\n\n"
+            "Invia il codice.",
+            parse_mode="HTML"
         )
+
         return
 
-    if action == "admin_status":
+    # -------------------------
+    # CAMBIA STATO
+    # -------------------------
+
+    if data == "admin_status":
+
         context.user_data["action"] = "status_code"
 
         await query.edit_message_text(
-            "🔄 CAMBIA STATO\n\n"
-            "Scrivi il codice dell'ordine."
+            "🔄 <b>Cambia stato</b>\n\n"
+            "Invia il codice dell'ordine.",
+            parse_mode="HTML"
         )
+
         return
 
-    if action == "admin_eta":
+    # -------------------------
+    # ETA
+    # -------------------------
+
+    if data == "admin_eta":
+
         context.user_data["action"] = "eta"
 
         await query.edit_message_text(
-            "⏱️ IMPOSTA MINUTI\n\n"
-            "Scrivi:\n"
-            "CODICE MINUTI\n\n"
+            "⏱️ <b>Imposta minuti</b>\n\n"
+            "Formato:\n"
+            "<code>CODICE MINUTI</code>\n\n"
             "Esempio:\n"
-            "ABC123 25"
+            "<code>ABC123 25</code>\n\n"
+            "Per rimuovere il tempo stimato:\n"
+            "<code>ABC123 0</code>",
+            parse_mode="HTML"
         )
+
         return
 
-    if action == "admin_stats":
-        con = db()
+    # -------------------------
+    # STATISTICHE
+    # -------------------------
 
-        total = con.execute(
+    if data == "admin_stats":
+
+        delete_expired_orders()
+
+        conn = db_connect()
+
+        total = conn.execute(
             "SELECT COUNT(*) FROM orders"
         ).fetchone()[0]
 
-        completed = con.execute("""
-            SELECT COUNT(*)
-            FROM orders
-            WHERE progress = 100
-        """).fetchone()[0]
+        completed = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE progress = 100"
+        ).fetchone()[0]
 
-        active = con.execute("""
-            SELECT COUNT(*)
-            FROM orders
-            WHERE progress < 100
-        """).fetchone()[0]
+        active = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE progress < 100"
+        ).fetchone()[0]
 
-        clients = con.execute("""
+        customers = conn.execute("""
             SELECT COUNT(DISTINCT telegram_user_id)
             FROM orders
             WHERE telegram_user_id IS NOT NULL
         """).fetchone()[0]
 
-        con.close()
+        conn.close()
 
         await query.edit_message_text(
-            "📊 STATISTICHE\n\n"
-            f"📦 Ordini totali: {total}\n"
-            f"🔄 Attivi: {active}\n"
-            f"🟢 Completati: {completed}\n"
-            f"👥 Clienti: {clients}",
+            "📊 <b>Statistiche</b>\n\n"
+            f"📦 Ordini presenti: <b>{total}</b>\n"
+            f"🟢 Completati: <b>{completed}</b>\n"
+            f"🟠 Attivi: <b>{active}</b>\n"
+            f"👥 Clienti associati: <b>{customers}</b>",
+            parse_mode="HTML",
             reply_markup=admin_menu()
         )
+
         return
 
-    if action == "admin_clients":
-        con = db()
+    # -------------------------
+    # CLIENTI
+    # -------------------------
 
-        rows = con.execute("""
-            SELECT DISTINCT telegram_user_id
+    if data == "admin_clients":
+
+        conn = db_connect()
+
+        rows = conn.execute("""
+            SELECT
+                telegram_user_id,
+                COUNT(*) AS orders_count,
+                MAX(updated_at) AS last_activity
             FROM orders
             WHERE telegram_user_id IS NOT NULL
-            ORDER BY telegram_user_id
+            GROUP BY telegram_user_id
+            ORDER BY last_activity DESC
         """).fetchall()
 
-        con.close()
+        conn.close()
 
         if not rows:
-            text = "👥 Nessun cliente associato."
-        else:
-            text = "👥 CLIENTI\n\n"
 
-            for row in rows:
-                text += f"🆔 {row['telegram_user_id']}\n"
+            await query.edit_message_text(
+                "👥 Nessun cliente associato.",
+                reply_markup=admin_menu()
+            )
+
+            return
+
+        text = "👥 <b>Clienti</b>\n\n"
+
+        for row in rows:
+
+            text += (
+                f"👤 ID: <code>{row['telegram_user_id']}</code>\n"
+                f"📦 Ordini: {row['orders_count']}\n"
+                f"🕐 Ultima attività: {row['last_activity']}\n\n"
+            )
 
         await query.edit_message_text(
-            text[:4000],
+            text,
+            parse_mode="HTML",
             reply_markup=admin_menu()
         )
+
         return
 
-    if action == "admin_logs":
-        con = db()
+    # -------------------------
+    # LOG
+    # -------------------------
 
-        rows = con.execute("""
-            SELECT username,
-                   order_code,
-                   action,
-                   message,
-                   created_at
+    if data == "admin_logs":
+
+        conn = db_connect()
+
+        rows = conn.execute("""
+            SELECT *
             FROM activity_logs
             ORDER BY id DESC
-            LIMIT 20
+            LIMIT 30
         """).fetchall()
 
-        con.close()
+        conn.close()
 
         if not rows:
-            text = "📜 Nessun log."
-        else:
-            text = "📜 ULTIMI LOG\n\n"
 
-            for row in rows:
-                text += (
-                    f"🕐 {row['created_at']}\n"
-                    f"👤 {row['username']}\n"
-                    f"📦 {row['order_code']}\n"
-                    f"⚡ {row['action']}\n"
-                    f"💬 {row['message']}\n\n"
-                )
+            await query.edit_message_text(
+                "📜 Nessun log.",
+                reply_markup=admin_menu()
+            )
+
+            return
+
+        text = "📜 <b>Ultime attività</b>\n\n"
+
+        for row in rows:
+
+            username = (
+                f"@{row['username']}"
+                if row["username"]
+                else "senza username"
+            )
+
+            text += (
+                f"👤 {username}\n"
+                f"🆔 {row['telegram_user_id']}\n"
+                f"⚙️ {row['action']}\n"
+            )
+
+            if row["order_code"]:
+                text += f"📦 {row['order_code']}\n"
+
+            if row["message"]:
+                text += f"💬 {row['message']}\n"
+
+            text += f"🕐 {row['created_at']}\n\n"
 
         await query.edit_message_text(
-            text[:4000],
+            text,
+            parse_mode="HTML",
             reply_markup=admin_menu()
         )
 
-
-# ============================================================
-# CAMBIO STATO
-# ============================================================
-
-async def status_code_received(update, context):
-    code = update.message.text.strip()
-
-    row = get_order(code)
-
-    if not row:
-        await update.message.reply_text(
-            "❌ Ordine non trovato.",
-            reply_markup=admin_menu()
-        )
-        context.user_data.clear()
         return
 
-    context.user_data["order_code"] = code
-    context.user_data["action"] = "status_value"
 
-    keyboard = InlineKeyboardMarkup([
+# =========================================================
+# STATUS BUTTONS
+# =========================================================
+
+async def status_code_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    code = update.message.text.strip().upper()
+
+    order = get_order(code)
+
+    if not order:
+
+        await update.message.reply_text(
+            "❌ Ordine non trovato."
+        )
+
+        return
+
+    context.user_data["status_code"] = code
+
+    keyboard = [
         [
             InlineKeyboardButton(
-                "🟡 0%",
+                "🟡 0% In attesa",
                 callback_data="status_0"
-            ),
+            )
+        ],
+        [
             InlineKeyboardButton(
-                "🔵 25%",
+                "🟠 25% Preso in carico",
                 callback_data="status_25"
             )
         ],
         [
             InlineKeyboardButton(
-                "🔵 50%",
+                "🟠 50% In elaborazione",
                 callback_data="status_50"
-            ),
+            )
+        ],
+        [
             InlineKeyboardButton(
                 "🟠 70% Quasi completato",
                 callback_data="status_70"
@@ -700,94 +848,163 @@ async def status_code_received(update, context):
                 callback_data="status_100"
             )
         ]
-    ])
+    ]
 
     await update.message.reply_text(
-        f"📦 Ordine #{code}\n\n"
+        f"🔄 <b>Ordine {code}</b>\n\n"
         "Scegli il nuovo stato:",
-        reply_markup=keyboard
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
-async def status_callback(update, context):
+# =========================================================
+# STATUS CALLBACK
+# =========================================================
+
+async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     query = update.callback_query
+
     await query.answer()
 
     if not is_admin(update):
+        await query.edit_message_text("❌ Non autorizzato.")
         return
 
-    code = context.user_data.get("order_code")
+    code = context.user_data.get("status_code")
 
     if not code:
         await query.edit_message_text(
-            "❌ Sessione scaduta.",
-            reply_markup=admin_menu()
+            "❌ Codice ordine non trovato."
         )
         return
 
-    value = query.data.replace("status_", "")
+    progress = int(query.data.replace("status_", ""))
 
-    status, progress = STATUSES[value]
+    status_names = {
+        0: "In attesa",
+        25: "Preso in carico",
+        50: "In elaborazione",
+        70: "Quasi completato",
+        100: "Completato"
+    }
 
-    row = get_order(code)
+    status = status_names[progress]
 
-    if not row:
-        await query.edit_message_text(
-            "❌ Ordine non trovato.",
-            reply_markup=admin_menu()
-        )
-        context.user_data.clear()
-        return
+    conn = db_connect()
 
-    con = db()
+    # =====================================================
+    # COMPLETATO
+    # =====================================================
 
-    con.execute("""
-        UPDATE orders
-        SET status = ?,
-            progress = ?,
-            updated_at = ?
+    if progress == 100:
+
+        completed_time = now_str()
+
+        conn.execute("""
+            UPDATE orders
+            SET status = ?,
+                progress = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE code = ?
+        """, (
+            status,
+            progress,
+            completed_time,
+            completed_time,
+            code
+        ))
+
+    # =====================================================
+    # QUALSIASI STATO PRIMA DEL COMPLETATO
+    # =====================================================
+
+    else:
+
+        conn.execute("""
+            UPDATE orders
+            SET status = ?,
+                progress = ?,
+                completed_at = NULL,
+                updated_at = ?
+            WHERE code = ?
+        """, (
+            status,
+            progress,
+            now_str(),
+            code
+        ))
+
+    conn.commit()
+
+    order = conn.execute("""
+        SELECT *
+        FROM orders
         WHERE code = ?
-    """, (
-        status,
-        progress,
-        now(),
-        code
-    ))
+    """, (code,)).fetchone()
 
-    con.commit()
-    con.close()
+    conn.close()
 
-    updated = get_order(code)
+    log_activity(
+        user_id=update.effective_user.id,
+        username=update.effective_user.username,
+        order_code=code,
+        action="change_status",
+        message=f"{status} ({progress}%)"
+    )
 
-    if row["telegram_user_id"]:
+    # =====================================================
+    # NOTIFICA CLIENTE
+    # =====================================================
+
+    if order and order["telegram_user_id"]:
+
         try:
-            await context.bot.send_message(
-                chat_id=row["telegram_user_id"],
-                text=(
-                    f"🔔 Aggiornamento ordine #{code}\n\n"
-                    + order_text(updated)
-                )
+
+            notification = (
+                "🔄 <b>Aggiornamento ordine</b>\n\n"
+                + order_text(order)
             )
+
+            if progress == 100:
+
+                notification += (
+                    "\n\n🕐 L'ordine rimarrà disponibile "
+                    "per 30 minuti, dopodiché verrà rimosso."
+                )
+
+            await context.bot.send_message(
+                chat_id=order["telegram_user_id"],
+                text=notification,
+                parse_mode="HTML"
+            )
+
         except Exception as e:
-            print("Errore notifica:", e)
+
+            print(
+                "Errore invio notifica cliente:",
+                e
+            )
 
     await query.edit_message_text(
-        f"✅ ORDINE AGGIORNATO\n\n"
-        f"📦 #{code}\n\n"
-        + order_text(updated),
+        f"✅ <b>Stato aggiornato</b>\n\n"
+        f"📦 Ordine: <b>{code}</b>\n"
+        f"📍 Stato: <b>{status}</b>\n"
+        f"📊 Avanzamento: <b>{progress}%</b>",
+        parse_mode="HTML",
         reply_markup=admin_menu()
     )
 
-    context.user_data.clear()
+    context.user_data.pop("status_code", None)
 
 
-# ============================================================
+# =========================================================
 # ADMIN TEXT
-# ============================================================
+# =========================================================
 
-async def admin_text(update, context):
-    if not is_admin(update):
-        return
+async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     action = context.user_data.get("action")
 
@@ -796,346 +1013,416 @@ async def admin_text(update, context):
 
     text = update.message.text.strip()
 
-    # --------------------------------------------------------
-    # CREA
-    # --------------------------------------------------------
+    # =====================================================
+    # CREA ORDINE
+    # =====================================================
 
     if action == "create":
-        code = text
+
+        code = text.upper()
 
         if get_order(code):
+
             await update.message.reply_text(
-                "❌ Questo codice esiste già.",
-                reply_markup=admin_menu()
+                "❌ Esiste già un ordine con questo codice."
             )
-            context.user_data.clear()
+
             return
 
-        con = db()
+        conn = db_connect()
 
-        con.execute("""
-            INSERT INTO orders(
+        conn.execute("""
+            INSERT INTO orders
+            (
                 code,
                 status,
                 progress,
                 eta_minutes,
                 telegram_user_id,
                 created_at,
-                updated_at
+                updated_at,
+                completed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             code,
             "In attesa",
             0,
             None,
             None,
-            now(),
-            now()
+            now_str(),
+            now_str(),
+            None
         ))
 
-        con.commit()
-        con.close()
+        conn.commit()
+        conn.close()
 
-        link = (
-            f"https://t.me/"
-            f"{BOT_USERNAME}"
-            f"?start={code}"
+        log_activity(
+            user_id=update.effective_user.id,
+            username=update.effective_user.username,
+            order_code=code,
+            action="create_order",
+            message=f"Creato ordine {code}"
         )
 
+        link = f"https://t.me/{BOT_USERNAME}?start={code}"
+
         await update.message.reply_text(
-            "✅ ORDINE CREATO\n\n"
-            f"📦 Codice: {code}\n"
-            f"🔗 Link:\n{link}",
+            "✅ <b>Ordine creato!</b>\n\n"
+            f"📦 Codice: <code>{code}</code>\n\n"
+            f"🔗 Link cliente:\n{link}",
+            parse_mode="HTML",
             reply_markup=admin_menu()
         )
 
-        context.user_data.clear()
+        context.user_data.pop("action", None)
+
         return
 
-    # --------------------------------------------------------
+    # =====================================================
     # CERCA
-    # --------------------------------------------------------
+    # =====================================================
 
     if action == "search":
-        row = get_order(text)
 
-        if not row:
+        code = text.upper()
+
+        order = get_order(code)
+
+        if not order:
+
             await update.message.reply_text(
                 "❌ Ordine non trovato.",
                 reply_markup=admin_menu()
             )
-        else:
-            eta = (
-                f"{row['eta_minutes']} minuti"
-                if row["eta_minutes"] is not None
-                else "Non impostato"
-            )
 
-            await update.message.reply_text(
-                f"📦 ORDINE #{row['code']}\n\n"
-                f"📌 Stato: {row['status']}\n"
-                f"📊 Progresso: {row['progress']}%\n"
-                f"⏱️ Tempo: {eta}\n"
-                f"👤 Telegram ID: "
-                f"{row['telegram_user_id'] or 'Non associato'}",
-                reply_markup=admin_menu()
-            )
+            context.user_data.pop("action", None)
 
-        context.user_data.clear()
+            return
+
+        await update.message.reply_text(
+            order_text(order),
+            parse_mode="HTML",
+            reply_markup=admin_menu()
+        )
+
+        context.user_data.pop("action", None)
+
         return
 
-    # --------------------------------------------------------
-    # STATO
-    # --------------------------------------------------------
+    # =====================================================
+    # CAMBIO STATO
+    # =====================================================
 
     if action == "status_code":
-        await status_code_received(update, context)
+
+        await status_code_received(
+            update,
+            context
+        )
+
+        context.user_data.pop("action", None)
+
         return
 
-    # --------------------------------------------------------
-    # MINUTI
-    # --------------------------------------------------------
+    # =====================================================
+    # ETA
+    # =====================================================
 
     if action == "eta":
+
         parts = text.split()
 
         if len(parts) != 2:
+
             await update.message.reply_text(
-                "❌ Formato:\nCODICE MINUTI\n\n"
-                "Esempio:\nABC123 25",
-                reply_markup=admin_menu()
+                "❌ Formato:\n\n"
+                "<code>CODICE MINUTI</code>\n\n"
+                "Esempio:\n"
+                "<code>ABC123 25</code>",
+                parse_mode="HTML"
             )
+
             return
 
-        code = parts[0]
+        code = parts[0].upper()
 
         try:
             minutes = int(parts[1])
-        except ValueError:
+        except:
+
             await update.message.reply_text(
-                "❌ I minuti devono essere un numero.",
-                reply_markup=admin_menu()
+                "❌ I minuti devono essere un numero."
             )
+
             return
 
         if minutes < 0:
+
             await update.message.reply_text(
-                "❌ Il valore non può essere negativo.",
-                reply_markup=admin_menu()
+                "❌ I minuti non possono essere negativi."
             )
+
             return
 
-        row = get_order(code)
+        order = get_order(code)
 
-        if not row:
+        if not order:
+
             await update.message.reply_text(
-                "❌ Ordine non trovato.",
-                reply_markup=admin_menu()
+                "❌ Ordine non trovato."
             )
-            context.user_data.clear()
+
             return
 
         eta = None if minutes == 0 else minutes
 
-        con = db()
+        conn = db_connect()
 
-        con.execute("""
+        conn.execute("""
             UPDATE orders
             SET eta_minutes = ?,
                 updated_at = ?
             WHERE code = ?
         """, (
             eta,
-            now(),
+            now_str(),
             code
         ))
 
-        con.commit()
-        con.close()
+        conn.commit()
 
-        updated = get_order(code)
+        order = conn.execute("""
+            SELECT *
+            FROM orders
+            WHERE code = ?
+        """, (code,)).fetchone()
 
-        if row["telegram_user_id"]:
+        conn.close()
+
+        log_activity(
+            user_id=update.effective_user.id,
+            username=update.effective_user.username,
+            order_code=code,
+            action="change_eta",
+            message=f"ETA: {minutes} minuti"
+        )
+
+        # Notifica cliente
+        if order["telegram_user_id"]:
+
             try:
+
                 await context.bot.send_message(
-                    chat_id=row["telegram_user_id"],
+                    chat_id=order["telegram_user_id"],
                     text=(
-                        f"🔔 Aggiornamento ordine #{code}\n\n"
-                        + order_text(updated)
-                    )
+                        "⏱️ <b>Aggiornamento tempo stimato</b>\n\n"
+                        + order_text(order)
+                    ),
+                    parse_mode="HTML"
                 )
+
             except Exception as e:
-                print("Errore notifica:", e)
+
+                print(
+                    "Errore notifica ETA:",
+                    e
+                )
 
         await update.message.reply_text(
-            f"✅ Tempo aggiornato.\n\n"
-            f"📦 #{code}\n"
-            f"⏱️ {minutes} minuti",
+            "✅ <b>Tempo aggiornato!</b>\n\n"
+            f"📦 Ordine: <b>{code}</b>\n"
+            f"⏱️ Minuti: <b>{minutes}</b>",
+            parse_mode="HTML",
             reply_markup=admin_menu()
         )
 
-        context.user_data.clear()
+        context.user_data.pop("action", None)
 
-
-# ============================================================
-# CLIENT CALLBACK
-# ============================================================
-
-async def client_callback(update, context):
-    query = update.callback_query
-    await query.answer()
-
-    user = update.effective_user
-
-    if query.data == "client_info":
-        await query.edit_message_text(
-            "ℹ️ INFORMAZIONI\n\n"
-            "Qui puoi controllare lo stato "
-            "del tuo ordine associato.",
-            reply_markup=client_menu()
-        )
         return
 
-    if query.data == "client_order":
-        row = get_user_order(user.id)
 
-        if not row:
+# =========================================================
+# CLIENT CALLBACK
+# =========================================================
+
+async def client_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user_id = update.effective_user.id
+    username = update.effective_user.username or ""
+
+    delete_expired_orders()
+
+    conn = db_connect()
+
+    order = conn.execute("""
+        SELECT *
+        FROM orders
+        WHERE telegram_user_id = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+    """, (user_id,)).fetchone()
+
+    conn.close()
+
+    if query.data in (
+        "client_order",
+        "client_refresh"
+    ):
+
+        log_activity(
+            user_id=user_id,
+            username=username,
+            order_code=order["code"] if order else None,
+            action=query.data,
+            message="Cliente ha richiesto ordine"
+        )
+
+        if not order:
+
             await query.edit_message_text(
-                "📦 Nessun ordine associato.",
-                reply_markup=client_menu()
+                "❌ Non hai nessun ordine associato."
             )
+
             return
 
         await query.edit_message_text(
-            f"📦 Ordine #{row['code']}\n\n"
-            + order_text(row),
+            order_text(order),
+            parse_mode="HTML",
+            reply_markup=client_menu()
+        )
+
+        return
+
+    if query.data == "client_info":
+
+        log_activity(
+            user_id=user_id,
+            username=username,
+            order_code=order["code"] if order else None,
+            action="client_info",
+            message="Cliente ha aperto informazioni"
+        )
+
+        await query.edit_message_text(
+            "ℹ️ <b>Informazioni</b>\n\n"
+            "Qui puoi controllare lo stato del tuo ordine "
+            "e il tempo stimato quando disponibile.",
+            parse_mode="HTML",
             reply_markup=client_menu()
         )
 
 
-# ============================================================
-# MESSAGGI CLIENTI
-# ============================================================
+# =========================================================
+# CLIENT MESSAGES / LOG
+# =========================================================
 
-async def client_message(update, context):
-    if is_admin(update):
+async def client_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    if not user:
         return
 
-    if not update.message:
-        return
+    username = user.username or ""
+    message = update.message.text or ""
 
-    text = update.message.text or "[Messaggio non testuale]"
+    conn = db_connect()
 
-    await log_activity(
-        update,
-        context,
-        "MESSAGGIO",
-        text
+    order = conn.execute("""
+        SELECT code
+        FROM orders
+        WHERE telegram_user_id = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+    """, (user.id,)).fetchone()
+
+    conn.close()
+
+    log_activity(
+        user_id=user.id,
+        username=username,
+        order_code=order["code"] if order else None,
+        action="client_message",
+        message=message
     )
 
     await update.message.reply_text(
-        "📩 Messaggio ricevuto.",
+        "📦 Usa i pulsanti qui sotto per controllare il tuo ordine.",
         reply_markup=client_menu()
     )
 
 
-# ============================================================
-# TELEGRAM
-# ============================================================
+# =========================================================
+# TEXT ROUTER
+# =========================================================
 
-application = (
-    Application.builder()
-    .token(TOKEN)
-    .build()
-)
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-application.add_handler(
-    CommandHandler("start", start)
-)
+    if is_admin(update):
 
-application.add_handler(
-    CommandHandler("admin", admin_command)
-)
-
-application.add_handler(
-    CallbackQueryHandler(
-        admin_callback,
-        pattern=r"^admin_"
-    )
-)
-
-application.add_handler(
-    CallbackQueryHandler(
-        status_callback,
-        pattern=r"^status_"
-    )
-)
-
-application.add_handler(
-    CallbackQueryHandler(
-        client_callback,
-        pattern=r"^client_"
-    )
-)
-
-# IMPORTANTE:
-# un unico handler per i messaggi di testo.
-application.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        lambda update, context: (
-            admin_text(update, context)
-            if is_admin(update)
-            else client_message(update, context)
+        await admin_text(
+            update,
+            context
         )
-    )
-)
+
+    else:
+
+        await client_message(
+            update,
+            context
+        )
 
 
-# ============================================================
-# FASTAPI / WEBHOOK
-# ============================================================
-
-app_web = FastAPI()
-
+# =========================================================
+# WEBHOOK
+# =========================================================
 
 @app_web.post("/telegram")
 async def telegram_webhook(request: Request):
+
     data = await request.json()
 
     update = Update.de_json(
         data,
-        application.bot
+        telegram_app.bot
     )
 
-    await application.process_update(update)
+    await telegram_app.process_update(update)
 
     return {"ok": True}
 
 
-# ============================================================
+@app_web.get("/")
+async def home():
+
+    return {
+        "status": "online",
+        "bot": BOT_USERNAME
+    }
+
+
+# =========================================================
 # STARTUP
-# ============================================================
+# =========================================================
 
-@app_web.on_event("startup")
 async def startup():
-    db().close()
 
-    await application.initialize()
-    await application.start()
+    await telegram_app.initialize()
+    await telegram_app.start()
 
-    external_url = os.environ.get(
-        "RENDER_EXTERNAL_URL"
-    )
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
 
-    if external_url:
-        webhook_url = (
-            external_url.rstrip("/")
-            + "/telegram"
-        )
+    if render_url:
 
-        await application.bot.set_webhook(
+        webhook_url = f"{render_url}/telegram"
+
+        await telegram_app.bot.set_webhook(
             webhook_url
         )
 
@@ -1144,12 +1431,60 @@ async def startup():
             webhook_url
         )
 
+    asyncio.create_task(
+        cleanup_loop()
+    )
 
-# ============================================================
-# SHUTDOWN
-# ============================================================
+    print("Bot avviato.")
 
-@app_web.on_event("shutdown")
-async def shutdown():
-    await application.stop()
-    await application.shutdown()
+
+asyncio.get_event_loop().run_until_complete(
+    startup()
+)
+
+
+# =========================================================
+# HANDLERS
+# =========================================================
+
+telegram_app.add_handler(
+    CommandHandler(
+        "start",
+        start
+    )
+)
+
+telegram_app.add_handler(
+    CommandHandler(
+        "admin",
+        admin_command
+    )
+)
+
+telegram_app.add_handler(
+    CallbackQueryHandler(
+        admin_callback,
+        pattern=r"^admin_"
+    )
+)
+
+telegram_app.add_handler(
+    CallbackQueryHandler(
+        status_callback,
+        pattern=r"^status_"
+    )
+)
+
+telegram_app.add_handler(
+    CallbackQueryHandler(
+        client_callback,
+        pattern=r"^client_"
+    )
+)
+
+telegram_app.add_handler(
+    MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        text_router
+    )
+)
