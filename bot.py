@@ -1,72 +1,54 @@
 import os
 import sqlite3
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-
-# ============================================================
-# CONFIGURAZIONE
-# ============================================================
-
 TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "weevoo26").lstrip("@")
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "Oorderstatebot").lstrip("@")
 
-ADMIN_USERNAME = os.environ.get(
-    "ADMIN_USERNAME",
-    "weevoo26"
-).lstrip("@")
-
-BOT_USERNAME = "Oorderstatebot"
-
-# Se /data esiste, usalo per un eventuale disco persistente Render.
-# Altrimenti usa orders.db nella cartella del progetto.
-if os.path.isdir("/data"):
-    DB = "/data/orders.db"
-else:
-    DB = "orders.db"
-
+# Render: use /data when a persistent disk is mounted.
+DB = "/data/orders.db" if os.path.isdir("/data") else "orders.db"
 
 app_web = FastAPI()
-
-tg_app = (
-    Application
-    .builder()
-    .token(TOKEN)
-    .build()
-)
+tg_app = Application.builder().token(TOKEN).build()
 
 
-# ============================================================
-# DATABASE
-# ============================================================
+STATUSES = {
+    "attesa": ("In attesa", "🟡", 0),
+    "lavorazione": ("In elaborazione", "🔵", 50),
+    "completato": ("Completato", "🟢", 100),
+    "annullato": ("Annullato", "🔴", 0),
+}
+
 
 def db():
-    con = sqlite3.connect(DB)
+    con = sqlite3.connect(DB, timeout=10)
+    con.row_factory = sqlite3.Row
 
     con.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             code TEXT PRIMARY KEY,
-            status TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'In attesa',
             progress INTEGER NOT NULL DEFAULT 0,
-            telegram_user_id INTEGER
+            minutes INTEGER,
+            telegram_user_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         )
     """)
 
-    # Tabella per ricordare l'ID Telegram dell'admin
     con.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -74,1135 +56,658 @@ def db():
         )
     """)
 
-    # Compatibilità con il vecchio database
-    columns = [
-        row[1]
-        for row in con.execute(
-            "PRAGMA table_info(orders)"
-        ).fetchall()
-    ]
-
-    if "telegram_user_id" not in columns:
-        con.execute(
-            "ALTER TABLE orders "
-            "ADD COLUMN telegram_user_id INTEGER"
-        )
-
     con.commit()
-
     return con
 
 
-# ============================================================
-# ADMIN
-# ============================================================
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
 
 def is_admin(update: Update):
     user = update.effective_user
-
     if not user:
         return False
 
-    if not user.username:
-        return False
-
-    return (
-        user.username.lower()
-        == ADMIN_USERNAME.lower()
-    )
-
-
-def save_admin_id(user_id):
+    # Stable ID saved after a successful admin login.
     con = db()
+    row = con.execute(
+        "SELECT value FROM settings WHERE key='admin_user_id'"
+    ).fetchone()
+    con.close()
 
+    if row and row["value"] == str(user.id):
+        return True
+
+    # First authorization can be done through ADMIN_USERNAME.
+    return bool(user.username and user.username.lower() == ADMIN_USERNAME.lower())
+
+
+def remember_admin(user_id: int):
+    con = db()
     con.execute(
-        """
-        INSERT INTO settings(key, value)
-        VALUES('admin_user_id', ?)
-        ON CONFLICT(key)
-        DO UPDATE SET value = excluded.value
-        """,
-        (str(user_id),)
+        "INSERT INTO settings(key,value) VALUES('admin_user_id',?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(user_id),),
     )
-
     con.commit()
     con.close()
 
 
-def get_admin_id():
-    con = db()
-
-    row = con.execute(
-        """
-        SELECT value
-        FROM settings
-        WHERE key = 'admin_user_id'
-        """
-    ).fetchone()
-
-    con.close()
-
-    if not row:
-        return None
-
-    try:
-        return int(row[0])
-    except ValueError:
-        return None
+def progress_bar(progress: int):
+    progress = max(0, min(100, int(progress)))
+    filled = round(progress / 10)
+    return "█" * filled + "░" * (10 - filled)
 
 
-# ============================================================
-# FORMAT STATO ORDINE
-# ============================================================
+def order_text(row, admin=False):
+    status = row["status"]
+    icon = next((v[1] for v in STATUSES.values() if v[0] == status), "⚪")
+    progress = row["progress"]
 
-def text_for(code, status, progress):
-
-    icons = {
-        "In attesa": "🟡",
-        "In elaborazione": "🔵",
-        "Completato": "🟢",
-        "Annullato": "🔴",
-    }
-
-    filled = max(
-        0,
-        min(
-            10,
-            round(progress / 10)
-        )
+    text = (
+        f"📦 <b>Ordine #{row['code']}</b>\n\n"
+        f"{icon} <b>Stato:</b> {status}\n"
+        f"📊 <code>{progress_bar(progress)}</code> {progress}%\n"
     )
 
-    bar = (
-        "█" * filled
-        + "░" * (10 - filled)
-    )
+    if row["minutes"] is not None:
+        text += f"⏱️ <b>Tempo indicativo:</b> {row['minutes']} minuti\n"
 
+    if admin:
+        linked = "Sì" if row["telegram_user_id"] else "No"
+        text += f"👤 <b>Cliente collegato:</b> {linked}\n"
+
+    return text
+
+
+def admin_main_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Crea ordine", callback_data="admin:create"),
+            InlineKeyboardButton("📦 Ordini", callback_data="admin:orders"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ Gestisci ordini", callback_data="admin:manage"),
+            InlineKeyboardButton("🗑️ Elimina", callback_data="admin:delete"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Aggiorna", callback_data="admin:home"),
+        ],
+    ])
+
+
+def order_keyboard(code):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🟡 Attesa", callback_data=f"status:{code}:attesa"),
+            InlineKeyboardButton("🔵 Lavorazione", callback_data=f"status:{code}:lavorazione"),
+        ],
+        [
+            InlineKeyboardButton("🟢 Completato", callback_data=f"status:{code}:completato"),
+            InlineKeyboardButton("🔴 Annullato", callback_data=f"status:{code}:annullato"),
+        ],
+        [
+            InlineKeyboardButton("⏱️ Imposta minuti", callback_data=f"minutes:{code}"),
+        ],
+        [
+            InlineKeyboardButton("🗑️ Elimina", callback_data=f"delete:{code}"),
+            InlineKeyboardButton("⬅️ Menu", callback_data="admin:manage"),
+        ],
+    ])
+
+
+def admin_home_text():
     return (
-        f"📦 *Ordine #{code}*\n\n"
-        f"{icons.get(status, '⚪')} "
-        f"*Stato:* {status}\n\n"
-        f"`{bar}` *{progress}%*"
+        "👑 <b>PANNELLO ADMIN</b>\n\n"
+        "Da qui puoi gestire tutto senza usare menu separati:\n"
+        "• creare ordini\n"
+        "• vedere gli ordini\n"
+        "• cambiare stato\n"
+        "• impostare percentuale e minuti\n"
+        "• eliminare ordini\n"
+        "• aprire il link cliente\n\n"
+        "👇 Scegli un'azione:"
     )
 
 
-# ============================================================
-# STATI DISPONIBILI
-# ============================================================
-
-STATUS_MAPPING = {
-    "attesa": ("In attesa", 0),
-    "lavorazione": ("In elaborazione", 50),
-    "completato": ("Completato", 100),
-    "annullato": ("Annullato", 0),
-}
-
-
-# ============================================================
-# LOG ATTIVITÀ CLIENTE
-# ============================================================
-
-async def notify_admin_activity(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user = update.effective_user
-
-    if not user:
-        return
-
-    # Non registrare le attività dell'admin
-    if is_admin(update):
-        return
-
-    admin_id = get_admin_id()
-
-    if not admin_id:
-        return
-
-    username = (
-        f"@{user.username}"
-        if user.username
-        else user.full_name
-    )
-
-    con = db()
-
-    row = con.execute(
-        """
-        SELECT code
-        FROM orders
-        WHERE telegram_user_id = ?
-        ORDER BY rowid DESC
-        LIMIT 1
-        """,
-        (user.id,)
-    ).fetchone()
-
-    con.close()
-
-    order_code = (
-        row[0]
-        if row
-        else "Nessun ordine associato"
-    )
-
-    # ========================================================
-    # Determina cosa ha fatto il cliente
-    # ========================================================
-
-    if update.message:
-
-        if update.message.text:
-
-            message_text = update.message.text
-
-        else:
-
-            message_text = "[Messaggio non testuale]"
-
-    elif update.callback_query:
-
-        message_text = (
-            f"[Pulsante: "
-            f"{update.callback_query.data}]"
+async def send_admin_home(target, edit=False):
+    if edit:
+        await target.edit_message_text(
+            admin_home_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_main_keyboard(),
         )
-
     else:
-
-        message_text = "[Interazione]"
-
-    # Limita messaggi enormi
-    if len(message_text) > 1500:
-        message_text = (
-            message_text[:1500]
-            + "..."
+        await target.reply_text(
+            admin_home_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_main_keyboard(),
         )
 
-    # Escape minimo per Markdown
-    safe_text = message_text.replace(
-        "`",
-        "'"
-    )
 
-    admin_text = (
-        "🔔 *ATTIVITÀ CLIENTE*\n\n"
-        f"👤 {username}\n"
-        f"🆔 ID: `{user.id}`\n"
-        f"📦 Ordine: `{order_code}`\n\n"
-        f"💬 Messaggio:\n"
-        f"`{safe_text}`"
-    )
-
-    try:
-
-        await context.bot.send_message(
-            chat_id=admin_id,
-            text=admin_text,
-            parse_mode="Markdown"
-        )
-
-    except Exception:
-        pass
-
-
-# ============================================================
-# /START
-# ============================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user = update.effective_user
-
-    if not user:
-        return
-
-    # Se sei admin, ricordiamo il tuo Telegram ID
-    if is_admin(update):
-        save_admin_id(user.id)
-
-    con = db()
-
-    # ========================================================
-    # /start CODICE
-    # ========================================================
-
-    if context.args:
-
-        code = context.args[0].strip()
-
-        row = con.execute(
-            """
-            SELECT code, status, progress
-            FROM orders
-            WHERE code = ?
-            """,
-            (code,)
-        ).fetchone()
-
-        if not row:
-
-            con.close()
-
-            await update.message.reply_text(
-                "❌ Ordine non trovato."
-            )
-
-            return
-
-        # Associa cliente all'ordine
-        con.execute(
-            """
-            UPDATE orders
-            SET telegram_user_id = ?
-            WHERE code = ?
-            """,
-            (
-                user.id,
-                code
-            )
-        )
-
-        con.commit()
-        con.close()
-
-        order_code, status, progress = row
-
-        await update.message.reply_text(
-            text_for(
-                order_code,
-                status,
-                progress
-            )
-            + "\n\n"
-            "✅ Ordine associato al tuo account.\n"
-            "La prossima volta ti basterà premere "
-            "/start.",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    # ========================================================
-    # /start SENZA CODICE
-    # ========================================================
-
-    row = con.execute(
-        """
-        SELECT code, status, progress
-        FROM orders
-        WHERE telegram_user_id = ?
-        ORDER BY rowid DESC
-        LIMIT 1
-        """,
-        (user.id,)
-    ).fetchone()
-
-    con.close()
-
-    if row:
-
-        await update.message.reply_text(
-            text_for(*row),
-            parse_mode="Markdown"
-        )
-
-        return
-
-    # Nessun ordine associato
-
-    await update.message.reply_text(
-        "👋 *Benvenuto!*\n\n"
-        "📦 Apri il link del tuo ordine e premi "
-        "*Start*.\n\n"
-        "Dopo la prima apertura, il bot ricorderà "
-        "automaticamente il tuo ordine.",
-        parse_mode="Markdown"
-    )
-
-
-# ============================================================
-# MENU ADMIN
-# ============================================================
-
-def admin_keyboard():
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "➕ Crea ordine",
-                callback_data="admin_create"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📦 Visualizza ordini",
-                callback_data="admin_orders"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🗑️ Elimina ordini",
-                callback_data="admin_delete"
-            )
-        ],
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
-
-
-async def admin(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
-
-        await update.message.reply_text(
-            "⛔ Accesso non autorizzato."
-        )
-
+        await update.message.reply_text("⛔ Accesso non autorizzato.")
         return
 
-    save_admin_id(
-        update.effective_user.id
-    )
-
-    await update.message.reply_text(
-        "👑 *PANNELLO ADMIN*\n\n"
-        "Scegli un'operazione:",
-        parse_mode="Markdown",
-        reply_markup=admin_keyboard()
-    )
+    remember_admin(update.effective_user.id)
+    await send_admin_home(update.message)
 
 
-# ============================================================
-# /CREA
-# ============================================================
-
-async def crea(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def create_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
 
-    save_admin_id(
-        update.effective_user.id
-    )
+    remember_admin(update.effective_user.id)
 
     if not context.args:
-
-        await update.message.reply_text(
-            "Usa:\n"
-            "/crea CODICE"
-        )
-
+        await update.message.reply_text("Uso: /crea CODICE")
         return
 
     code = context.args[0].strip()
+    if not code or len(code) > 80:
+        await update.message.reply_text("❌ Codice non valido.")
+        return
 
     con = db()
-
     try:
-
+        stamp = now()
         con.execute(
-            """
-            INSERT INTO orders(
-                code,
-                status,
-                progress,
-                telegram_user_id
-            )
-            VALUES (?, ?, ?, NULL)
-            """,
-            (
-                code,
-                "In attesa",
-                0
-            )
+            "INSERT INTO orders(code,status,progress,minutes,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (code, "In attesa", 0, None, stamp, stamp),
         )
-
         con.commit()
-
     except sqlite3.IntegrityError:
-
         con.close()
-
-        await update.message.reply_text(
-            "⚠️ Questo codice esiste già."
-        )
-
+        await update.message.reply_text("⚠️ Questo codice esiste già.")
         return
 
     con.close()
 
-    link = (
-        f"https://t.me/"
-        f"{BOT_USERNAME}"
-        f"?start={code}"
-    )
-
+    link = f"https://t.me/{BOT_USERNAME}?start={code}"
     await update.message.reply_text(
-        "✅ *ORDINE CREATO*\n\n"
-        f"📦 Codice: `{code}`\n"
-        f"🟡 Stato: In attesa\n\n"
-        "🔗 *Link cliente:*\n"
-        f"{link}",
-        parse_mode="Markdown"
+        f"✅ <b>Ordine #{code} creato</b>\n\n"
+        f"🔗 <b>Link cliente:</b>\n{link}",
+        parse_mode=ParseMode.HTML,
     )
 
 
-# ============================================================
-# /STATO
-# ============================================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    code = context.args[0].strip() if context.args else None
 
-async def stato(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+    if not code:
+        # If the client has already been linked to an order, show the latest one.
+        con = db()
+        row = con.execute(
+            "SELECT * FROM orders WHERE telegram_user_id=? "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (user.id,),
+        ).fetchone()
+        con.close()
 
-    if not is_admin(update):
+        if row:
+            await update.message.reply_text(
+                order_text(row), parse_mode=ParseMode.HTML
+            )
+        else:
+            await update.message.reply_text(
+                "👋 Benvenuto!\n\nApri il link del tuo ordine per collegarlo e vedere lo stato."
+            )
         return
-
-    save_admin_id(
-        update.effective_user.id
-    )
-
-    if len(context.args) < 2:
-
-        await update.message.reply_text(
-            "Uso:\n"
-            "/stato CODICE attesa\n"
-            "/stato CODICE lavorazione\n"
-            "/stato CODICE completato\n"
-            "/stato CODICE annullato"
-        )
-
-        return
-
-    code = context.args[0].strip()
-    state = context.args[1].lower().strip()
-
-    if state not in STATUS_MAPPING:
-
-        await update.message.reply_text(
-            "❌ Stato non valido."
-        )
-
-        return
-
-    status, progress = STATUS_MAPPING[state]
 
     con = db()
-
     row = con.execute(
-        """
-        SELECT
-            code,
-            telegram_user_id
-        FROM orders
-        WHERE code = ?
-        """,
-        (code,)
+        "SELECT * FROM orders WHERE code=?", (code,)
     ).fetchone()
 
     if not row:
-
         con.close()
-
-        await update.message.reply_text(
-            "❌ Ordine non trovato."
-        )
-
+        await update.message.reply_text("❌ Ordine non trovato.")
         return
 
-    telegram_user_id = row[1]
-
-    # AGGIORNA ORDINE
+    # Link the Telegram account to this order.
     con.execute(
-        """
-        UPDATE orders
-        SET
-            status = ?,
-            progress = ?
-        WHERE code = ?
-        """,
-        (
-            status,
-            progress,
-            code
-        )
+        "UPDATE orders SET telegram_user_id=?, updated_at=? WHERE code=?",
+        (user.id, now(), code),
     )
-
     con.commit()
+    row = con.execute(
+        "SELECT * FROM orders WHERE code=?", (code,)
+    ).fetchone()
     con.close()
 
-    # Conferma admin
     await update.message.reply_text(
-        "✅ *ORDINE AGGIORNATO*\n\n"
-        + text_for(
-            code,
-            status,
-            progress
-        ),
-        parse_mode="Markdown"
+        order_text(row), parse_mode=ParseMode.HTML
     )
 
-    # ========================================================
-    # NOTIFICA CLIENTE
-    # ========================================================
 
-    if telegram_user_id:
+async def show_orders_message(message, manage=False):
+    con = db()
+    rows = con.execute(
+        "SELECT * FROM orders ORDER BY updated_at DESC"
+    ).fetchall()
+    con.close()
 
-        try:
+    if not rows:
+        await message.reply_text(
+            "📦 <b>Nessun ordine presente.</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Menu", callback_data="admin:home")]
+            ]),
+        )
+        return
 
-            await context.bot.send_message(
-                chat_id=telegram_user_id,
-                text=(
-                    "🔔 *Aggiornamento ordine*\n\n"
-                    + text_for(
-                        code,
-                        status,
-                        progress
-                    )
-                ),
-                parse_mode="Markdown"
+    text = "📦 <b>ORDINI</b>\n\n"
+    buttons = []
+
+    for row in rows[:50]:
+        text += (
+            f"• <b>#{row['code']}</b> — {row['status']} — "
+            f"{row['progress']}%"
+        )
+        if row["minutes"] is not None:
+            text += f" — ⏱️ {row['minutes']}m"
+        text += "\n"
+
+        buttons.append([
+            InlineKeyboardButton(
+                f"⚙️ #{row['code']}",
+                callback_data=f"open:{row['code']}"
             )
+        ])
 
+    buttons.append([
+        InlineKeyboardButton("⬅️ Menu", callback_data="admin:home")
+    ])
+
+    await message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(update):
+        await query.answer("⛔ Non autorizzato.", show_alert=True)
+        return
+
+    remember_admin(update.effective_user.id)
+    data = query.data or ""
+
+    if data == "admin:home":
+        await send_admin_home(query, edit=True)
+        return
+
+    if data == "admin:create":
+        await query.edit_message_text(
+            "➕ <b>CREA ORDINE</b>\n\n"
+            "Usa:\n<code>/crea CODICE</code>\n\n"
+            "Dopo la creazione, torna qui con /admin.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Menu", callback_data="admin:home")]
+            ]),
+        )
+        return
+
+    if data in ("admin:orders", "admin:manage"):
+        con = db()
+        rows = con.execute(
+            "SELECT * FROM orders ORDER BY updated_at DESC"
+        ).fetchall()
+        con.close()
+
+        if not rows:
+            await query.edit_message_text(
+                "📦 <b>Nessun ordine presente.</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Menu", callback_data="admin:home")]
+                ]),
+            )
+            return
+
+        buttons = []
+        for row in rows[:50]:
+            buttons.append([
+                InlineKeyboardButton(
+                    f"📦 #{row['code']} · {row['status']} · {row['progress']}%",
+                    callback_data=f"open:{row['code']}"
+                )
+            ])
+
+        buttons.append([
+            InlineKeyboardButton("⬅️ Menu", callback_data="admin:home")
+        ])
+
+        title = "⚙️ <b>GESTIONE ORDINI</b>" if data == "admin:manage" else "📦 <b>ORDINI</b>"
+        await query.edit_message_text(
+            title + "\n\nSeleziona un ordine:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data == "admin:delete":
+        con = db()
+        rows = con.execute(
+            "SELECT code,status FROM orders ORDER BY updated_at DESC"
+        ).fetchall()
+        con.close()
+
+        if not rows:
+            await query.edit_message_text(
+                "🗑️ Nessun ordine da eliminare.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Menu", callback_data="admin:home")]
+                ]),
+            )
+            return
+
+        buttons = [
+            [InlineKeyboardButton(
+                f"🗑️ #{r['code']} — {r['status']}",
+                callback_data=f"delete:{r['code']}"
+            )]
+            for r in rows[:50]
+        ]
+        buttons.append([
+            InlineKeyboardButton("⬅️ Menu", callback_data="admin:home")
+        ])
+
+        await query.edit_message_text(
+            "🗑️ <b>ELIMINA ORDINE</b>\n\nSeleziona quello da eliminare:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("open:"):
+        code = data.split(":", 1)[1]
+        con = db()
+        row = con.execute(
+            "SELECT * FROM orders WHERE code=?", (code,)
+        ).fetchone()
+        con.close()
+
+        if not row:
+            await query.edit_message_text(
+                "❌ Ordine non trovato.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Menu", callback_data="admin:manage")]
+                ]),
+            )
+            return
+
+        await query.edit_message_text(
+            order_text(row, admin=True),
+            parse_mode=ParseMode.HTML,
+            reply_markup=order_keyboard(code),
+        )
+        return
+
+    if data.startswith("status:"):
+        _, code, new_status = data.split(":", 2)
+        if new_status not in STATUSES:
+            return
+
+        status, _, default_progress = STATUSES[new_status]
+
+        con = db()
+        old = con.execute(
+            "SELECT * FROM orders WHERE code=?", (code,)
+        ).fetchone()
+
+        if not old:
+            con.close()
+            await query.edit_message_text("❌ Ordine non trovato.")
+            return
+
+        con.execute(
+            "UPDATE orders SET status=?, progress=?, updated_at=? WHERE code=?",
+            (status, default_progress, now(), code),
+        )
+        con.commit()
+        row = con.execute(
+            "SELECT * FROM orders WHERE code=?", (code,)
+        ).fetchone()
+        con.close()
+
+        await query.edit_message_text(
+            order_text(row, admin=True),
+            parse_mode=ParseMode.HTML,
+            reply_markup=order_keyboard(code),
+        )
+
+        # Notify linked customer automatically.
+        if row["telegram_user_id"]:
+            try:
+                await context.bot.send_message(
+                    chat_id=row["telegram_user_id"],
+                    text="🔔 <b>Aggiornamento ordine</b>\n\n" + order_text(row),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+        return
+
+    if data.startswith("minutes:"):
+        code = data.split(":", 1)[1]
+        context.user_data["waiting_minutes_for"] = code
+
+        await query.edit_message_text(
+            f"⏱️ <b>MINUTI — ORDINE #{code}</b>\n\n"
+            "Scrivi un numero, ad esempio:\n"
+            "<code>30</code>\n\n"
+            "Per rimuovere i minuti scrivi:\n"
+            "<code>0</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Annulla", callback_data=f"open:{code}")]
+            ]),
+        )
+        return
+
+    if data.startswith("delete:"):
+        code = data.split(":", 1)[1]
+        await query.edit_message_text(
+            f"⚠️ <b>Confermi l'eliminazione di #{code}?</b>\n\n"
+            "Questa operazione elimina definitivamente l'ordine dal database.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Sì, elimina", callback_data=f"confirmdelete:{code}"),
+                    InlineKeyboardButton("❌ No", callback_data=f"open:{code}"),
+                ]
+            ]),
+        )
+        return
+
+    if data.startswith("confirmdelete:"):
+        code = data.split(":", 1)[1]
+        con = db()
+        cur = con.execute("DELETE FROM orders WHERE code=?", (code,))
+        con.commit()
+        con.close()
+
+        if cur.rowcount:
+            await query.edit_message_text(
+                f"✅ Ordine <b>#{code}</b> eliminato.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📦 Gestisci ordini", callback_data="admin:manage")],
+                    [InlineKeyboardButton("⬅️ Menu", callback_data="admin:home")],
+                ]),
+            )
+        else:
+            await query.edit_message_text("❌ Ordine non trovato.")
+        return
+
+
+async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    code = context.user_data.get("waiting_minutes_for")
+    if not code:
+        return
+
+    raw = (update.message.text or "").strip()
+    if not raw.isdigit():
+        await update.message.reply_text("❌ Inserisci solo un numero di minuti.")
+        return
+
+    minutes = int(raw)
+    if minutes > 100000:
+        await update.message.reply_text("❌ Numero di minuti troppo alto.")
+        return
+
+    context.user_data.pop("waiting_minutes_for", None)
+
+    con = db()
+    row = con.execute(
+        "SELECT * FROM orders WHERE code=?", (code,)
+    ).fetchone()
+
+    if not row:
+        con.close()
+        await update.message.reply_text("❌ Ordine non trovato.")
+        return
+
+    new_minutes = None if minutes == 0 else minutes
+    con.execute(
+        "UPDATE orders SET minutes=?, updated_at=? WHERE code=?",
+        (new_minutes, now(), code),
+    )
+    con.commit()
+    row = con.execute(
+        "SELECT * FROM orders WHERE code=?", (code,)
+    ).fetchone()
+    con.close()
+
+    await update.message.reply_text(
+        "✅ Minuti aggiornati.\n\n" + order_text(row, admin=True),
+        parse_mode=ParseMode.HTML,
+        reply_markup=order_keyboard(code),
+    )
+
+    if row["telegram_user_id"]:
+        try:
+            await context.bot.send_message(
+                chat_id=row["telegram_user_id"],
+                text="🔔 <b>Aggiornamento ordine</b>\n\n" + order_text(row),
+                parse_mode=ParseMode.HTML,
+            )
         except Exception:
             pass
 
 
-# ============================================================
-# VISUALIZZA ORDINI
-# ============================================================
-
-async def show_orders(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    if not query:
-        return
-
-    await query.answer()
-
+async def stato_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Compatibility command: /stato CODICE attesa|lavorazione|completato|annullato"""
     if not is_admin(update):
         return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Uso: /stato CODICE attesa|lavorazione|completato|annullato"
+        )
+        return
+
+    code = context.args[0].strip()
+    key = context.args[1].lower()
+
+    if key not in STATUSES:
+        await update.message.reply_text("❌ Stato non valido.")
+        return
+
+    status, _, progress = STATUSES[key]
 
     con = db()
+    old = con.execute(
+        "SELECT * FROM orders WHERE code=?", (code,)
+    ).fetchone()
 
-    rows = con.execute(
-        """
-        SELECT code, status, progress
-        FROM orders
-        ORDER BY rowid DESC
-        """
-    ).fetchall()
-
-    con.close()
-
-    if not rows:
-
-        await query.edit_message_text(
-            "📦 *ORDINI*\n\n"
-            "Non ci sono ordini.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Indietro",
-                        callback_data="admin_back"
-                    )
-                ]
-            ])
-        )
-
+    if not old:
+        con.close()
+        await update.message.reply_text("❌ Ordine non trovato.")
         return
 
-    text = "📦 *ORDINI ESISTENTI*\n\n"
-
-    for code, status, progress in rows:
-
-        text += (
-            f"• `{code}` — "
-            f"{status} — "
-            f"{progress}%\n"
-        )
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "⬅️ Indietro",
-                callback_data="admin_back"
-            )
-        ]
-    ]
-
-    await query.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        )
+    con.execute(
+        "UPDATE orders SET status=?, progress=?, updated_at=? WHERE code=?",
+        (status, progress, now(), code),
     )
-
-
-# ============================================================
-# MENU ELIMINA ORDINI
-# ============================================================
-
-async def delete_orders_menu(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    if not query:
-        return
-
-    await query.answer()
-
-    if not is_admin(update):
-        return
-
-    con = db()
-
-    rows = con.execute(
-        """
-        SELECT code, status
-        FROM orders
-        ORDER BY rowid DESC
-        """
-    ).fetchall()
-
-    con.close()
-
-    if not rows:
-
-        await query.edit_message_text(
-            "🗑️ *ELIMINA ORDINI*\n\n"
-            "Non ci sono ordini da eliminare.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Indietro",
-                        callback_data="admin_back"
-                    )
-                ]
-            ])
-        )
-
-        return
-
-    keyboard = []
-
-    for code, status in rows:
-
-        keyboard.append([
-            InlineKeyboardButton(
-                f"🗑️ {code} — {status}",
-                callback_data=f"delete:{code}"
-            )
-        ])
-
-    keyboard.append([
-        InlineKeyboardButton(
-            "⬅️ Indietro",
-            callback_data="admin_back"
-        )
-    ])
-
-    await query.edit_message_text(
-        "🗑️ *ELIMINA ORDINI*\n\n"
-        "⚠️ Scegli l'ordine che vuoi eliminare.\n"
-        "Gli ordini NON vengono eliminati automaticamente.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        )
-    )
-
-
-# ============================================================
-# CONFERMA ELIMINAZIONE
-# ============================================================
-
-async def confirm_delete(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    if not query:
-        return
-
-    await query.answer()
-
-    if not is_admin(update):
-        return
-
-    code = query.data.split(
-        ":",
-        1
-    )[1]
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "✅ Sì, elimina",
-                callback_data=f"confirm_delete:{code}"
-            ),
-            InlineKeyboardButton(
-                "❌ Annulla",
-                callback_data="admin_delete"
-            )
-        ]
-    ]
-
-    await query.edit_message_text(
-        "⚠️ *CONFERMA ELIMINAZIONE*\n\n"
-        f"Vuoi eliminare definitivamente "
-        f"l'ordine `{code}`?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        )
-    )
-
-
-# ============================================================
-# ELIMINA ORDINE
-# ============================================================
-
-async def delete_order(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    if not query:
-        return
-
-    await query.answer()
-
-    if not is_admin(update):
-        return
-
-    code = query.data.split(
-        ":",
-        1
-    )[1]
-
-    con = db()
-
-    cur = con.execute(
-        """
-        DELETE FROM orders
-        WHERE code = ?
-        """,
-        (code,)
-    )
-
     con.commit()
+    row = con.execute(
+        "SELECT * FROM orders WHERE code=?", (code,)
+    ).fetchone()
     con.close()
 
-    if cur.rowcount == 0:
-
-        await query.edit_message_text(
-            "❌ Ordine non trovato.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Indietro",
-                        callback_data="admin_delete"
-                    )
-                ]
-            ])
-        )
-
-        return
-
-    await query.edit_message_text(
-        "🗑️ *ORDINE ELIMINATO*\n\n"
-        f"Ordine `{code}` eliminato correttamente.\n\n"
-        "Questo è l'unico modo con cui il bot "
-        "elimina un ordine.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🗑️ Elimina altri",
-                    callback_data="admin_delete"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⬅️ Menu",
-                    callback_data="admin_back"
-                )
-            ]
-        ])
+    await update.message.reply_text(
+        order_text(row, admin=True),
+        parse_mode=ParseMode.HTML,
+        reply_markup=order_keyboard(code),
     )
 
-
-# ============================================================
-# TORNA AL MENU ADMIN
-# ============================================================
-
-async def admin_back(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    if not query:
-        return
-
-    await query.answer()
-
-    if not is_admin(update):
-        return
-
-    await query.edit_message_text(
-        "👑 *PANNELLO ADMIN*\n\n"
-        "Scegli un'operazione:",
-        parse_mode="Markdown",
-        reply_markup=admin_keyboard()
-    )
+    if row["telegram_user_id"]:
+        try:
+            await context.bot.send_message(
+                chat_id=row["telegram_user_id"],
+                text="🔔 <b>Aggiornamento ordine</b>\n\n" + order_text(row),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
 
-# ============================================================
-# BOTTONI ADMIN
-# ============================================================
+# Commands
+tg_app.add_handler(CommandHandler("start", start))
+tg_app.add_handler(CommandHandler("admin", admin_command))
+tg_app.add_handler(CommandHandler("crea", create_command))
+tg_app.add_handler(CommandHandler("stato", stato_command))
 
-async def admin_button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+# Buttons
+tg_app.add_handler(CallbackQueryHandler(callback))
 
-    query = update.callback_query
-
-    if not query:
-        return
-
-    if not is_admin(update):
-        await query.answer(
-            "Non autorizzato.",
-            show_alert=True
-        )
-        return
-
-    data = query.data
-
-    if data == "admin_orders":
-
-        await show_orders(
-            update,
-            context
-        )
-
-    elif data == "admin_delete":
-
-        await delete_orders_menu(
-            update,
-            context
-        )
-
-    elif data == "admin_create":
-
-        await query.answer()
-
-        await query.edit_message_text(
-            "➕ *CREA ORDINE*\n\n"
-            "Invia ora:\n"
-            "`/crea CODICE`\n\n"
-            "Esempio:\n"
-            "`/crea TEST123`",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Indietro",
-                        callback_data="admin_back"
-                    )
-                ]
-            ])
-        )
-
-    elif data == "admin_back":
-
-        await admin_back(
-            update,
-            context
-        )
-
-    elif data.startswith("delete:"):
-
-        await confirm_delete(
-            update,
-            context
-        )
-
-    elif data.startswith("confirm_delete:"):
-
-        await delete_order(
-            update,
-            context
-        )
-
-
-# ============================================================
-# MESSAGGI CLIENTI
-# ============================================================
-
-async def client_message_logger(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    # Registra soltanto messaggi normali dei clienti
-    await notify_admin_activity(
-        update,
-        context
-    )
-
-
-# ============================================================
-# HANDLER TELEGRAM
-# ============================================================
-
+# Admin numeric input for the minutes flow.
 tg_app.add_handler(
-    CommandHandler(
-        "start",
-        start
-    ),
-    group=0
+    MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_input)
 )
 
-tg_app.add_handler(
-    CommandHandler(
-        "admin",
-        admin
-    ),
-    group=0
-)
-
-tg_app.add_handler(
-    CommandHandler(
-        "crea",
-        crea
-    ),
-    group=0
-)
-
-tg_app.add_handler(
-    CommandHandler(
-        "stato",
-        stato
-    ),
-    group=0
-)
-
-tg_app.add_handler(
-    CallbackQueryHandler(
-        admin_button_handler
-    ),
-    group=0
-)
-
-# Messaggi normali dei clienti
-tg_app.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        client_message_logger
-    ),
-    group=1
-)
-
-
-# ============================================================
-# HOME
-# ============================================================
 
 @app_web.get("/")
 async def home():
+    return {"status": "ok", "bot": "telegram-order-bot"}
 
-    return {
-        "status": "ok",
-        "bot": "telegram-order-bot"
-    }
-
-
-# ============================================================
-# WEBHOOK TELEGRAM
-# ============================================================
 
 @app_web.post("/telegram")
-async def telegram_webhook(
-    request: Request
-):
-
+async def telegram_webhook(request: Request):
     data = await request.json()
+    await tg_app.process_update(Update.de_json(data, tg_app.bot))
+    return {"ok": True}
 
-    update = Update.de_json(
-        data,
-        tg_app.bot
-    )
-
-    await tg_app.process_update(
-        update
-    )
-
-    return {
-        "ok": True
-    }
-
-
-# ============================================================
-# STARTUP
-# ============================================================
 
 @app_web.on_event("startup")
 async def startup():
-
-    db().close()
+    con = db()
+    con.close()
 
     await tg_app.initialize()
-
     await tg_app.start()
 
-    external = os.environ.get(
-        "RENDER_EXTERNAL_URL"
-    )
-
+    external = os.environ.get("RENDER_EXTERNAL_URL")
     if external:
+        await tg_app.bot.set_webhook(external.rstrip("/") + "/telegram")
 
-        await tg_app.bot.set_webhook(
-            external.rstrip("/")
-            + "/telegram"
-        )
-
-
-# ============================================================
-# SHUTDOWN
-# ============================================================
 
 @app_web.on_event("shutdown")
 async def shutdown():
-
     await tg_app.stop()
-
     await tg_app.shutdown()
