@@ -1,5 +1,4 @@
 
-
 """
 Telegram Order Manager — production-oriented single-file bot.
 
@@ -33,7 +32,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Request
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
@@ -700,9 +699,15 @@ async def create_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ <b>ORDINE CREATO</b>\n\n"
         + order_text(row, admin=True)
-        + f"\n🔗 <b>Link cliente:</b>\n<code>{esc(link)}</code>",
+        + f"\n🔗 <b>Link cliente:</b> <a href=\"{esc(link)}\">Apri il link</a>\n\n<code>{esc(link)}</code>",
         parse_mode=ParseMode.HTML,
-        reply_markup=order_keyboard(code),
+        reply_markup=InlineKeyboardMarkup(
+            order_keyboard(code).inline_keyboard
+            + [[
+                InlineKeyboardButton("🔗 Apri link", url=link),
+                InlineKeyboardButton("📋 Copia link", copy_text=CopyTextButton(link)),
+            ]]
+        ),
     )
 
 
@@ -1001,12 +1006,12 @@ async def render_search(update: Update, term: str):
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     if not is_admin(update):
         await query.answer("⛔ Accesso non autorizzato.", show_alert=True)
         return
 
+    await query.answer()
     remember_admin(update.effective_user.id)
     data = query.data or ""
 
@@ -1287,8 +1292,14 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             f"🔗 <b>LINK CLIENTE</b>\n\n"
             f"Ordine: <b>#{esc(code)}</b>\n\n"
-            f"<code>{esc(link)}</code>",
+            f"👉 <a href=\"{esc(link)}\">Apri il link del cliente</a>\n\n"
+            f"<code>{esc(link)}</code>\n\n"
+            "💡 Puoi anche copiare l'URL qui sopra e inviarlo direttamente al cliente.",
             InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🔗 Apri link cliente", url=link),
+                    InlineKeyboardButton("📋 Copia link", copy_text=CopyTextButton(link)),
+                ],
                 [InlineKeyboardButton("⬅️ Ordine", callback_data=f"open:{code}")]
             ]),
         )
@@ -1403,9 +1414,15 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "✅ <b>ORDINE CREATO</b>\n\n"
             + order_text(row, admin=True)
-            + f"\n🔗 <b>Link:</b>\n<code>{esc(link)}</code>",
+            + f"\n🔗 <b>Link:</b> <a href=\"{esc(link)}\">Apri il link</a>\n\n<code>{esc(link)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=order_keyboard(text),
+            reply_markup=InlineKeyboardMarkup(
+            order_keyboard(text).inline_keyboard
+            + [[
+                InlineKeyboardButton("🔗 Apri link", url=link),
+                InlineKeyboardButton("📋 Copia link", copy_text=CopyTextButton(link)),
+            ]]
+        ),
         )
         return
 
