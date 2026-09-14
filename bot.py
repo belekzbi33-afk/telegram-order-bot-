@@ -1,4 +1,5 @@
 
+
 """
 Telegram Order Manager — production-oriented single-file bot.
 
@@ -71,6 +72,7 @@ MAX_BROADCAST = 500
 STATUSES = {
     "attesa": ("In attesa", "🟡", 0),
     "lavorazione": ("In elaborazione", "🔵", 50),
+    "quasi_fatto": ("Quasi fatto", "🟠", 80),
     "completato": ("Completato", "🟢", 100),
     "annullato": ("Annullato", "🔴", 0),
 }
@@ -109,6 +111,7 @@ def migrate_db() -> None:
             status TEXT NOT NULL DEFAULT 'In attesa',
             progress INTEGER NOT NULL DEFAULT 0,
             minutes INTEGER,
+            note TEXT,
             telegram_user_id INTEGER,
             customer_username TEXT,
             customer_name TEXT,
@@ -121,6 +124,7 @@ def migrate_db() -> None:
     # Migrate columns from the user's original DB without deleting data.
     migrations = [
         ("minutes", "INTEGER"),
+        ("note", "TEXT"),
         ("telegram_user_id", "INTEGER"),
         ("customer_username", "TEXT"),
         ("customer_name", "TEXT"),
@@ -338,6 +342,9 @@ def order_text(row: sqlite3.Row, admin: bool = False) -> str:
     if row["minutes"] is not None:
         text += f"⏱️ <b>Minuti:</b> {row['minutes']}\n"
 
+    if row["note"]:
+        text += f"📝 <b>Nota:</b> {esc(row['note'])}\n"
+
     if admin:
         linked = "Sì" if row["telegram_user_id"] else "No"
         customer = ""
@@ -435,12 +442,18 @@ def order_keyboard(code: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔵 Lavorazione", callback_data=f"status:{code}:lavorazione"),
         ],
         [
+            InlineKeyboardButton("🟠 Quasi fatto", callback_data=f"status:{code}:quasi_fatto"),
             InlineKeyboardButton("🟢 Completato", callback_data=f"status:{code}:completato"),
+        ],
+        [
             InlineKeyboardButton("🔴 Annullato", callback_data=f"status:{code}:annullato"),
         ],
         [
             InlineKeyboardButton("📊 Progresso", callback_data=f"progress:{code}"),
             InlineKeyboardButton("⏱️ Minuti", callback_data=f"minutes:{code}"),
+        ],
+        [
+            InlineKeyboardButton("📝 Nota / messaggio", callback_data=f"note:{code}"),
         ],
         [
             InlineKeyboardButton("🔗 Link cliente", callback_data=f"link:{code}"),
@@ -699,7 +712,7 @@ async def stato_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Uso: /stato CODICE attesa|lavorazione|completato|annullato"
+            "Uso: /stato CODICE attesa|lavorazione|quasi_fatto|completato|annullato"
         )
         return
 
@@ -1192,6 +1205,45 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Note / customer-facing message
+    if data.startswith("note:"):
+        code = data.split(":", 1)[1]
+        context.user_data["awaiting"] = f"note:{code}"
+
+        con = db()
+        row = con.execute("SELECT note FROM orders WHERE code=?", (code,)).fetchone()
+        con.close()
+        current = row["note"] if row else None
+
+        await edit_or_send(
+            update,
+            f"📝 <b>NOTA ORDINE — #{esc(code)}</b>\n\n"
+            "Scrivi il messaggio che vuoi mostrare al cliente insieme allo stato.\n"
+            "È <b>opzionale</b>: puoi anche lasciare la nota vuota/rimuoverla.\n\n"
+            + (f"Nota attuale: <blockquote>{esc(current)}</blockquote>\n\n" if current else "Nessuna nota impostata.\n\n")
+            + "Esempio: <i>L'ordine non è andato a buon fine per un problema tecnico.</i>",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑️ Rimuovi nota", callback_data=f"note_clear:{code}")],
+                [InlineKeyboardButton("⬅️ Ordine", callback_data=f"open:{code}")],
+            ]),
+        )
+        return
+
+    if data.startswith("note_clear:"):
+        code = data.split(":", 1)[1]
+        con = db()
+        con.execute("UPDATE orders SET note=NULL, updated_at=? WHERE code=?", (now_iso(), code))
+        con.commit()
+        row = con.execute("SELECT * FROM orders WHERE code=?", (code,)).fetchone()
+        con.close()
+        if row:
+            log_activity(update, "note", f"{code} -> cleared")
+            await notify_customer(context, row, "📝 Nota ordine aggiornata")
+            await edit_or_send(update, "✅ <b>Nota rimossa</b>\n\n" + order_text(row, admin=True), order_keyboard(code))
+        else:
+            await edit_or_send(update, "❌ Ordine non trovato.", back_home_keyboard())
+        return
+
     # Customer info
     if data.startswith("customer:"):
         code = data.split(":", 1)[1]
@@ -1386,6 +1438,32 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ),
                 ]
             ]),
+        )
+        return
+
+    if state.startswith("note:"):
+        code = state.split(":", 1)[1]
+        context.user_data.pop("awaiting", None)
+
+        con = db()
+        row = con.execute("SELECT * FROM orders WHERE code=?", (code,)).fetchone()
+        if not row:
+            con.close()
+            await update.message.reply_text("❌ Ordine non trovato.")
+            return
+
+        note = text.strip() or None
+        con.execute("UPDATE orders SET note=?, updated_at=? WHERE code=?", (note, now_iso(), code))
+        con.commit()
+        row = con.execute("SELECT * FROM orders WHERE code=?", (code,)).fetchone()
+        con.close()
+
+        log_activity(update, "note", f"{code} -> {'set' if note else 'cleared'}")
+        await notify_customer(context, row, "📝 Nota ordine aggiornata")
+        await update.message.reply_text(
+            "✅ <b>Nota salvata</b>\n\n" + order_text(row, admin=True),
+            parse_mode=ParseMode.HTML,
+            reply_markup=order_keyboard(code),
         )
         return
 
