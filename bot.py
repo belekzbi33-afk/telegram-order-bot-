@@ -35,8 +35,13 @@ telegram_app = Application.builder().token(TOKEN).build()
 # =========================================================
 
 def db_connect():
-    conn = sqlite3.connect(DB)
+    conn = sqlite3.connect(DB, timeout=30)
     conn.row_factory = sqlite3.Row
+
+    # Migliora la stabilità di SQLite
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+
     return conn
 
 
@@ -76,10 +81,12 @@ def init_db():
         )
     """)
 
-    # Migrazione per database vecchi che non hanno completed_at
+    # Migrazione database vecchio
     columns = [
         row["name"]
-        for row in cur.execute("PRAGMA table_info(orders)").fetchall()
+        for row in cur.execute(
+            "PRAGMA table_info(orders)"
+        ).fetchall()
     ]
 
     if "completed_at" not in columns:
@@ -95,7 +102,7 @@ init_db()
 
 
 # =========================================================
-# UTILS
+# TIME
 # =========================================================
 
 def now():
@@ -106,11 +113,19 @@ def now_str():
     return now().isoformat()
 
 
+# =========================================================
+# ADMIN
+# =========================================================
+
 def get_admin_id():
     conn = db_connect()
-    row = conn.execute(
-        "SELECT value FROM settings WHERE key = 'admin_id'"
-    ).fetchone()
+
+    row = conn.execute("""
+        SELECT value
+        FROM settings
+        WHERE key = 'admin_id'
+    """).fetchone()
+
     conn.close()
 
     if row:
@@ -124,17 +139,23 @@ def get_admin_id():
 
 def save_admin_id(user_id):
     conn = db_connect()
+
     conn.execute("""
         INSERT INTO settings(key, value)
-        VALUES('admin_id', ?)
+        VALUES (?, ?)
         ON CONFLICT(key)
         DO UPDATE SET value = excluded.value
-    """, (str(user_id),))
+    """, (
+        "admin_id",
+        str(user_id)
+    ))
+
     conn.commit()
     conn.close()
 
 
 def is_admin(update: Update):
+
     user = update.effective_user
 
     if not user:
@@ -145,6 +166,10 @@ def is_admin(update: Update):
     return username.lower() == ADMIN_USERNAME.lower()
 
 
+# =========================================================
+# LOG
+# =========================================================
+
 def log_activity(
     user_id=None,
     username=None,
@@ -152,11 +177,11 @@ def log_activity(
     action="",
     message=""
 ):
+
     conn = db_connect()
 
     conn.execute("""
-        INSERT INTO activity_logs
-        (
+        INSERT INTO activity_logs (
             telegram_user_id,
             username,
             order_code,
@@ -179,16 +204,77 @@ def log_activity(
 
 
 # =========================================================
-# AUTO DELETE ORDERS
+# ORDERS
 # =========================================================
 
-def delete_expired_orders():
+def get_order(code):
+
+    conn = db_connect()
+
+    row = conn.execute("""
+        SELECT *
+        FROM orders
+        WHERE code = ?
+    """, (
+        code.upper(),
+    )).fetchone()
+
+    conn.close()
+
+    return row
+
+
+def progress_bar(progress):
+
+    total = 10
+
+    filled = round(progress / 10)
+
+    return (
+        "█" * filled +
+        "░" * (total - filled)
+    )
+
+
+def order_text(row):
+
+    text = (
+        f"📦 <b>Ordine {row['code']}</b>\n\n"
+        f"📍 Stato: <b>{row['status']}</b>\n"
+        f"📊 Avanzamento: <b>{row['progress']}%</b>\n\n"
+        f"{progress_bar(row['progress'])}"
+    )
+
+    if row["eta_minutes"] is not None:
+
+        text += (
+            f"\n\n⏱️ Tempo stimato: "
+            f"<b>{row['eta_minutes']} minuti</b>"
+        )
+
+    return text
+
+
+# =========================================================
+# CANCELLAZIONE AUTOMATICA
+# =========================================================
+
+def delete_expired_completed_orders():
+
     """
-    Cancella esclusivamente gli ordini completati da almeno 30 minuti.
-    Gli ordini non completati non vengono mai cancellati.
+    IMPORTANTE:
+
+    Un ordine viene cancellato SOLO se:
+    - progress = 100
+    - completed_at esiste
+    - sono passati almeno 30 minuti
+
+    Tutti gli altri ordini rimangono per sempre.
     """
 
-    limit = now() - timedelta(minutes=30)
+    expiration_time = (
+        now() - timedelta(minutes=30)
+    ).isoformat()
 
     conn = db_connect()
 
@@ -198,20 +284,27 @@ def delete_expired_orders():
         WHERE progress = 100
         AND completed_at IS NOT NULL
         AND completed_at <= ?
-    """, (limit.isoformat(),)).fetchall()
+    """, (
+        expiration_time,
+    )).fetchall()
 
     for row in rows:
+
         code = row["code"]
 
-        conn.execute(
-            "DELETE FROM orders WHERE code = ?",
-            (code,)
-        )
+        conn.execute("""
+            DELETE FROM orders
+            WHERE code = ?
+            AND progress = 100
+            AND completed_at IS NOT NULL
+        """, (
+            code,
+        ))
 
         log_activity(
-            action="auto_delete",
             order_code=code,
-            message="Ordine cancellato automaticamente dopo 30 minuti dal completamento."
+            action="auto_delete",
+            message="Ordine eliminato 30 minuti dopo il completamento."
         )
 
     conn.commit()
@@ -219,58 +312,20 @@ def delete_expired_orders():
 
 
 async def cleanup_loop():
+
     while True:
+
         try:
-            delete_expired_orders()
+            delete_expired_completed_orders()
+
         except Exception as e:
-            print("Errore cleanup:", e)
+            print(
+                "Errore pulizia ordini:",
+                e
+            )
 
-        # Controlla ogni minuto
+        # Controlla una volta al minuto
         await asyncio.sleep(60)
-
-
-# =========================================================
-# ORDER FUNCTIONS
-# =========================================================
-
-def get_order(code):
-    conn = db_connect()
-
-    row = conn.execute("""
-        SELECT *
-        FROM orders
-        WHERE code = ?
-    """, (code.upper(),)).fetchone()
-
-    conn.close()
-
-    return row
-
-
-def progress_bar(progress):
-    total = 10
-    filled = round(progress / 10)
-
-    return "█" * filled + "░" * (total - filled)
-
-
-def order_text(row):
-
-    status = row["status"]
-    progress = row["progress"]
-    eta = row["eta_minutes"]
-
-    text = (
-        f"📦 <b>Ordine {row['code']}</b>\n\n"
-        f"📍 Stato: <b>{status}</b>\n"
-        f"📊 Avanzamento: <b>{progress}%</b>\n\n"
-        f"{progress_bar(progress)}"
-    )
-
-    if eta is not None:
-        text += f"\n\n⏱️ Tempo stimato: <b>{eta} minuti</b>"
-
-    return text
 
 
 # =========================================================
@@ -280,6 +335,7 @@ def order_text(row):
 def admin_menu():
 
     keyboard = [
+
         [
             InlineKeyboardButton(
                 "➕ Crea ordine",
@@ -290,6 +346,7 @@ def admin_menu():
                 callback_data="admin_list"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "🔎 Cerca ordine",
@@ -300,6 +357,7 @@ def admin_menu():
                 callback_data="admin_status"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "⏱️ Imposta minuti",
@@ -310,6 +368,7 @@ def admin_menu():
                 callback_data="admin_stats"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "👥 Clienti",
@@ -332,12 +391,14 @@ def admin_menu():
 def client_menu():
 
     keyboard = [
+
         [
             InlineKeyboardButton(
                 "📦 Il mio ordine",
                 callback_data="client_order"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "🔄 Aggiorna",
@@ -354,7 +415,7 @@ def client_menu():
 
 
 # =========================================================
-# /START
+# START
 # =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -366,15 +427,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     username = user.username or ""
 
-    # Salva automaticamente l'ID dell'admin
+    # ADMIN
     if username.lower() == ADMIN_USERNAME.lower():
+
         save_admin_id(user.id)
 
         log_activity(
             user_id=user.id,
             username=username,
             action="admin_start",
-            message="/start admin"
+            message="/start"
         )
 
         await update.message.reply_text(
@@ -386,12 +448,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    args = context.args
-
     # /start CODICE
-    if args:
+    if context.args:
 
-        code = args[0].upper()
+        code = context.args[0].strip().upper()
 
         order = get_order(code)
 
@@ -401,7 +461,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_id=user.id,
                 username=username,
                 order_code=code,
-                action="start_invalid_order",
+                action="invalid_order",
                 message=f"/start {code}"
             )
 
@@ -411,7 +471,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             return
 
-        # Associa l'utente all'ordine
+        # ASSOCIA CLIENTE
         conn = db_connect()
 
         conn.execute("""
@@ -437,15 +497,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await update.message.reply_text(
-            "✅ Ordine associato!\n\n" +
-            order_text(get_order(code)),
+            "✅ <b>Ordine associato!</b>\n\n"
+            + order_text(get_order(code)),
             parse_mode="HTML",
             reply_markup=client_menu()
         )
 
         return
 
-    # /start senza codice
+    # /start SENZA CODICE
     conn = db_connect()
 
     order = conn.execute("""
@@ -454,17 +514,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         WHERE telegram_user_id = ?
         ORDER BY updated_at DESC
         LIMIT 1
-    """, (user.id,)).fetchone()
+    """, (
+        user.id,
+    )).fetchone()
 
     conn.close()
-
-    log_activity(
-        user_id=user.id,
-        username=username,
-        order_code=order["code"] if order else None,
-        action="client_start",
-        message="/start"
-    )
 
     if order:
 
@@ -481,6 +535,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Non hai ancora un ordine associato."
         )
 
+    log_activity(
+        user_id=user.id,
+        username=username,
+        order_code=order["code"] if order else None,
+        action="client_start",
+        message="/start"
+    )
+
 
 # =========================================================
 # /ADMIN
@@ -496,13 +558,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    save_admin_id(update.effective_user.id)
-
-    log_activity(
-        user_id=update.effective_user.id,
-        username=update.effective_user.username,
-        action="admin_panel",
-        message="/admin"
+    save_admin_id(
+        update.effective_user.id
     )
 
     await update.message.reply_text(
@@ -523,15 +580,16 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if not is_admin(update):
-        await query.edit_message_text("❌ Non autorizzato.")
+
+        await query.edit_message_text(
+            "❌ Non autorizzato."
+        )
+
         return
 
     data = query.data
 
-    # -------------------------
     # CREA
-    # -------------------------
-
     if data == "admin_create":
 
         context.user_data["action"] = "create"
@@ -546,13 +604,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # -------------------------
     # LISTA
-    # -------------------------
-
     if data == "admin_list":
 
-        delete_expired_orders()
+        delete_expired_completed_orders()
 
         conn = db_connect()
 
@@ -579,11 +634,15 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             text += (
                 f"📦 <b>{row['code']}</b>\n"
-                f"   {row['status']} — {row['progress']}%\n"
+                f"📍 {row['status']}\n"
+                f"📊 {row['progress']}%\n"
             )
 
             if row["eta_minutes"] is not None:
-                text += f"   ⏱️ {row['eta_minutes']} min\n"
+
+                text += (
+                    f"⏱️ {row['eta_minutes']} minuti\n"
+                )
 
             text += "\n"
 
@@ -595,10 +654,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # -------------------------
     # CERCA
-    # -------------------------
-
     if data == "admin_search":
 
         context.user_data["action"] = "search"
@@ -611,10 +667,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # -------------------------
     # CAMBIA STATO
-    # -------------------------
-
     if data == "admin_status":
 
         context.user_data["action"] = "status_code"
@@ -627,10 +680,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # -------------------------
     # ETA
-    # -------------------------
-
     if data == "admin_eta":
 
         context.user_data["action"] = "eta"
@@ -641,20 +691,17 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<code>CODICE MINUTI</code>\n\n"
             "Esempio:\n"
             "<code>ABC123 25</code>\n\n"
-            "Per rimuovere il tempo stimato:\n"
+            "Per rimuovere il tempo:\n"
             "<code>ABC123 0</code>",
             parse_mode="HTML"
         )
 
         return
 
-    # -------------------------
     # STATISTICHE
-    # -------------------------
-
     if data == "admin_stats":
 
-        delete_expired_orders()
+        delete_expired_completed_orders()
 
         conn = db_connect()
 
@@ -662,15 +709,15 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "SELECT COUNT(*) FROM orders"
         ).fetchone()[0]
 
-        completed = conn.execute(
-            "SELECT COUNT(*) FROM orders WHERE progress = 100"
-        ).fetchone()[0]
-
         active = conn.execute(
             "SELECT COUNT(*) FROM orders WHERE progress < 100"
         ).fetchone()[0]
 
-        customers = conn.execute("""
+        completed = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE progress = 100"
+        ).fetchone()[0]
+
+        clients = conn.execute("""
             SELECT COUNT(DISTINCT telegram_user_id)
             FROM orders
             WHERE telegram_user_id IS NOT NULL
@@ -681,19 +728,16 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📊 <b>Statistiche</b>\n\n"
             f"📦 Ordini presenti: <b>{total}</b>\n"
-            f"🟢 Completati: <b>{completed}</b>\n"
             f"🟠 Attivi: <b>{active}</b>\n"
-            f"👥 Clienti associati: <b>{customers}</b>",
+            f"🟢 Completati: <b>{completed}</b>\n"
+            f"👥 Clienti: <b>{clients}</b>",
             parse_mode="HTML",
             reply_markup=admin_menu()
         )
 
         return
 
-    # -------------------------
     # CLIENTI
-    # -------------------------
-
     if data == "admin_clients":
 
         conn = db_connect()
@@ -725,9 +769,9 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for row in rows:
 
             text += (
-                f"👤 ID: <code>{row['telegram_user_id']}</code>\n"
+                f"🆔 <code>{row['telegram_user_id']}</code>\n"
                 f"📦 Ordini: {row['orders_count']}\n"
-                f"🕐 Ultima attività: {row['last_activity']}\n\n"
+                f"🕐 {row['last_activity']}\n\n"
             )
 
         await query.edit_message_text(
@@ -738,10 +782,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # -------------------------
     # LOG
-    # -------------------------
-
     if data == "admin_logs":
 
         conn = db_connect()
@@ -781,12 +822,20 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             if row["order_code"]:
-                text += f"📦 {row['order_code']}\n"
+
+                text += (
+                    f"📦 {row['order_code']}\n"
+                )
 
             if row["message"]:
-                text += f"💬 {row['message']}\n"
 
-            text += f"🕐 {row['created_at']}\n\n"
+                text += (
+                    f"💬 {row['message']}\n"
+                )
+
+            text += (
+                f"🕐 {row['created_at']}\n\n"
+            )
 
         await query.edit_message_text(
             text,
@@ -794,14 +843,12 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=admin_menu()
         )
 
-        return
-
 
 # =========================================================
-# STATUS BUTTONS
+# STATUS CODE
 # =========================================================
 
-async def status_code_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def status_code_received(update, context):
 
     code = update.message.text.strip().upper()
 
@@ -818,30 +865,35 @@ async def status_code_received(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["status_code"] = code
 
     keyboard = [
+
         [
             InlineKeyboardButton(
                 "🟡 0% In attesa",
                 callback_data="status_0"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "🟠 25% Preso in carico",
                 callback_data="status_25"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "🟠 50% In elaborazione",
                 callback_data="status_50"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "🟠 70% Quasi completato",
                 callback_data="status_70"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "🟢 100% Completato",
@@ -869,18 +921,29 @@ async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if not is_admin(update):
-        await query.edit_message_text("❌ Non autorizzato.")
+
+        await query.edit_message_text(
+            "❌ Non autorizzato."
+        )
+
         return
 
     code = context.user_data.get("status_code")
 
     if not code:
+
         await query.edit_message_text(
             "❌ Codice ordine non trovato."
         )
+
         return
 
-    progress = int(query.data.replace("status_", ""))
+    progress = int(
+        query.data.replace(
+            "status_",
+            ""
+        )
+    )
 
     status_names = {
         0: "In attesa",
@@ -895,12 +958,12 @@ async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = db_connect()
 
     # =====================================================
-    # COMPLETATO
+    # 100% COMPLETATO
     # =====================================================
 
     if progress == 100:
 
-        completed_time = now_str()
+        completed_at = now_str()
 
         conn.execute("""
             UPDATE orders
@@ -912,13 +975,19 @@ async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (
             status,
             progress,
-            completed_time,
-            completed_time,
+            completed_at,
+            completed_at,
             code
         ))
 
     # =====================================================
-    # QUALSIASI STATO PRIMA DEL COMPLETATO
+    # TUTTI GLI ALTRI STATI
+    #
+    # completed_at = NULL
+    #
+    # Questo è IMPORTANTISSIMO:
+    # se torna al 70%, 50%, 25% o 0%,
+    # il timer dei 30 minuti viene completamente annullato.
     # =====================================================
 
     else:
@@ -943,16 +1012,19 @@ async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         SELECT *
         FROM orders
         WHERE code = ?
-    """, (code,)).fetchone()
+    """, (
+        code,
+    )).fetchone()
 
     conn.close()
 
+    # LOG
     log_activity(
         user_id=update.effective_user.id,
         username=update.effective_user.username,
         order_code=code,
         action="change_status",
-        message=f"{status} ({progress}%)"
+        message=f"{status} - {progress}%"
     )
 
     # =====================================================
@@ -963,48 +1035,51 @@ async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
 
-            notification = (
+            message = (
                 "🔄 <b>Aggiornamento ordine</b>\n\n"
                 + order_text(order)
             )
 
             if progress == 100:
 
-                notification += (
-                    "\n\n🕐 L'ordine rimarrà disponibile "
-                    "per 30 minuti, dopodiché verrà rimosso."
+                message += (
+                    "\n\n⏱️ L'ordine rimarrà disponibile "
+                    "per altri 30 minuti."
                 )
 
             await context.bot.send_message(
                 chat_id=order["telegram_user_id"],
-                text=notification,
+                text=message,
                 parse_mode="HTML"
             )
 
         except Exception as e:
 
             print(
-                "Errore invio notifica cliente:",
+                "Errore notifica cliente:",
                 e
             )
 
     await query.edit_message_text(
         f"✅ <b>Stato aggiornato</b>\n\n"
         f"📦 Ordine: <b>{code}</b>\n"
-        f"📍 Stato: <b>{status}</b>\n"
-        f"📊 Avanzamento: <b>{progress}%</b>",
+        f"📍 {status}\n"
+        f"📊 {progress}%",
         parse_mode="HTML",
         reply_markup=admin_menu()
     )
 
-    context.user_data.pop("status_code", None)
+    context.user_data.pop(
+        "status_code",
+        None
+    )
 
 
 # =========================================================
 # ADMIN TEXT
 # =========================================================
 
-async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_text(update, context):
 
     action = context.user_data.get("action")
 
@@ -1024,7 +1099,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if get_order(code):
 
             await update.message.reply_text(
-                "❌ Esiste già un ordine con questo codice."
+                "❌ Esiste già questo ordine."
             )
 
             return
@@ -1032,8 +1107,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn = db_connect()
 
         conn.execute("""
-            INSERT INTO orders
-            (
+            INSERT INTO orders (
                 code,
                 status,
                 progress,
@@ -1063,20 +1137,27 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             username=update.effective_user.username,
             order_code=code,
             action="create_order",
-            message=f"Creato ordine {code}"
+            message=f"Creato {code}"
         )
 
-        link = f"https://t.me/{BOT_USERNAME}?start={code}"
+        link = (
+            f"https://t.me/"
+            f"{BOT_USERNAME}"
+            f"?start={code}"
+        )
 
         await update.message.reply_text(
             "✅ <b>Ordine creato!</b>\n\n"
             f"📦 Codice: <code>{code}</code>\n\n"
-            f"🔗 Link cliente:\n{link}",
+            f"🔗 Link:\n{link}",
             parse_mode="HTML",
             reply_markup=admin_menu()
         )
 
-        context.user_data.pop("action", None)
+        context.user_data.pop(
+            "action",
+            None
+        )
 
         return
 
@@ -1097,7 +1178,10 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=admin_menu()
             )
 
-            context.user_data.pop("action", None)
+            context.user_data.pop(
+                "action",
+                None
+            )
 
             return
 
@@ -1107,12 +1191,15 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=admin_menu()
         )
 
-        context.user_data.pop("action", None)
+        context.user_data.pop(
+            "action",
+            None
+        )
 
         return
 
     # =====================================================
-    # CAMBIO STATO
+    # STATO
     # =====================================================
 
     if action == "status_code":
@@ -1122,7 +1209,10 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context
         )
 
-        context.user_data.pop("action", None)
+        context.user_data.pop(
+            "action",
+            None
+        )
 
         return
 
@@ -1149,7 +1239,9 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         code = parts[0].upper()
 
         try:
+
             minutes = int(parts[1])
+
         except:
 
             await update.message.reply_text(
@@ -1176,7 +1268,11 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             return
 
-        eta = None if minutes == 0 else minutes
+        eta = (
+            None
+            if minutes == 0
+            else minutes
+        )
 
         conn = db_connect()
 
@@ -1197,7 +1293,9 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             SELECT *
             FROM orders
             WHERE code = ?
-        """, (code,)).fetchone()
+        """, (
+            code,
+        )).fetchone()
 
         conn.close()
 
@@ -1206,10 +1304,10 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             username=update.effective_user.username,
             order_code=code,
             action="change_eta",
-            message=f"ETA: {minutes} minuti"
+            message=f"{minutes} minuti"
         )
 
-        # Notifica cliente
+        # NOTIFICA
         if order["telegram_user_id"]:
 
             try:
@@ -1232,22 +1330,23 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             "✅ <b>Tempo aggiornato!</b>\n\n"
-            f"📦 Ordine: <b>{code}</b>\n"
-            f"⏱️ Minuti: <b>{minutes}</b>",
+            f"📦 {code}\n"
+            f"⏱️ {minutes} minuti",
             parse_mode="HTML",
             reply_markup=admin_menu()
         )
 
-        context.user_data.pop("action", None)
-
-        return
+        context.user_data.pop(
+            "action",
+            None
+        )
 
 
 # =========================================================
 # CLIENT CALLBACK
 # =========================================================
 
-async def client_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def client_callback(update, context):
 
     query = update.callback_query
 
@@ -1256,7 +1355,8 @@ async def client_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or ""
 
-    delete_expired_orders()
+    # Pulizia: NON cancella gli ordini normali
+    delete_expired_completed_orders()
 
     conn = db_connect()
 
@@ -1266,22 +1366,17 @@ async def client_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         WHERE telegram_user_id = ?
         ORDER BY updated_at DESC
         LIMIT 1
-    """, (user_id,)).fetchone()
+    """, (
+        user_id,
+    )).fetchone()
 
     conn.close()
 
+    # ORDINE
     if query.data in (
         "client_order",
         "client_refresh"
     ):
-
-        log_activity(
-            user_id=user_id,
-            username=username,
-            order_code=order["code"] if order else None,
-            action=query.data,
-            message="Cliente ha richiesto ordine"
-        )
 
         if not order:
 
@@ -1297,32 +1392,41 @@ async def client_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=client_menu()
         )
 
+        log_activity(
+            user_id=user_id,
+            username=username,
+            order_code=order["code"],
+            action=query.data,
+            message="Visualizzazione ordine"
+        )
+
         return
 
+    # INFO
     if query.data == "client_info":
+
+        await query.edit_message_text(
+            "ℹ️ <b>Informazioni</b>\n\n"
+            "Puoi controllare qui lo stato "
+            "e l'eventuale tempo stimato del tuo ordine.",
+            parse_mode="HTML",
+            reply_markup=client_menu()
+        )
 
         log_activity(
             user_id=user_id,
             username=username,
             order_code=order["code"] if order else None,
             action="client_info",
-            message="Cliente ha aperto informazioni"
-        )
-
-        await query.edit_message_text(
-            "ℹ️ <b>Informazioni</b>\n\n"
-            "Qui puoi controllare lo stato del tuo ordine "
-            "e il tempo stimato quando disponibile.",
-            parse_mode="HTML",
-            reply_markup=client_menu()
+            message="Aperte informazioni"
         )
 
 
 # =========================================================
-# CLIENT MESSAGES / LOG
+# CLIENT MESSAGES
 # =========================================================
 
-async def client_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def client_message(update, context):
 
     user = update.effective_user
 
@@ -1340,7 +1444,9 @@ async def client_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         WHERE telegram_user_id = ?
         ORDER BY updated_at DESC
         LIMIT 1
-    """, (user.id,)).fetchone()
+    """, (
+        user.id,
+    )).fetchone()
 
     conn.close()
 
@@ -1353,7 +1459,7 @@ async def client_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        "📦 Usa i pulsanti qui sotto per controllare il tuo ordine.",
+        "📦 Usa i pulsanti qui sotto.",
         reply_markup=client_menu()
     )
 
@@ -1362,7 +1468,7 @@ async def client_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # TEXT ROUTER
 # =========================================================
 
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def text_router(update, context):
 
     if is_admin(update):
 
@@ -1393,9 +1499,13 @@ async def telegram_webhook(request: Request):
         telegram_app.bot
     )
 
-    await telegram_app.process_update(update)
+    await telegram_app.process_update(
+        update
+    )
 
-    return {"ok": True}
+    return {
+        "ok": True
+    }
 
 
 @app_web.get("/")
@@ -1416,11 +1526,15 @@ async def startup():
     await telegram_app.initialize()
     await telegram_app.start()
 
-    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    render_url = os.environ.get(
+        "RENDER_EXTERNAL_URL"
+    )
 
     if render_url:
 
-        webhook_url = f"{render_url}/telegram"
+        webhook_url = (
+            f"{render_url}/telegram"
+        )
 
         await telegram_app.bot.set_webhook(
             webhook_url
@@ -1431,11 +1545,14 @@ async def startup():
             webhook_url
         )
 
+    # Avvia controllo automatico
     asyncio.create_task(
         cleanup_loop()
     )
 
-    print("Bot avviato.")
+    print(
+        "BOT AVVIATO"
+    )
 
 
 asyncio.get_event_loop().run_until_complete(
